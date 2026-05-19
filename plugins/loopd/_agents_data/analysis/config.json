@@ -1,0 +1,13 @@
+{
+  "name": "analysis",
+  "description": "Analysis Agent - Research, brainstorming, and product brief creation",
+  "max_tokens": 100000,
+  "timeout_seconds": 600,
+  "retry_on_failure": true,
+  "max_retries": 3,
+  "subagents": ["research", "brainstorm", "product_brief"],
+  "outputs": ["product_brief.md", "research_notes.md", "brainstorm_results.md"],
+  "next_agent": "planning",
+  "can_escalate": true,
+  "requires_human_approval": false
+}

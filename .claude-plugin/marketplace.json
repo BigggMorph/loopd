@@ -1,0 +1,22 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "loopd",
+  "description": "Synchronous multi-phase dev task runner for Claude Code — planning → implementation → review in a single window with workspace-isolated git worktrees.",
+  "owner": {
+    "name": "BigggMorph",
+    "email": "biggg.morph@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "loopd",
+      "description": "Run /dev-task to kick off a planning → implementation → review pipeline in the current Claude Code window. Replaces the oh-my-agents daemon + Slack architecture with synchronous, workspace-isolated execution.",
+      "author": {
+        "name": "BigggMorph",
+        "email": "biggg.morph@gmail.com"
+      },
+      "category": "development",
+      "source": "./plugins/loopd",
+      "homepage": "https://github.com/BigggMorph/loopd"
+    }
+  ]
+}

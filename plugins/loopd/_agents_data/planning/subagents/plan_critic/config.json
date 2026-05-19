@@ -1,0 +1,10 @@
+{
+  "name": "plan_critic",
+  "parent": "planning",
+  "description": "Plan Critic — Evaluates planning artifacts (PRD, UX Design) against 4-axis quality rubric",
+  "max_tokens": 40000,
+  "timeout_seconds": 600,
+  "outputs": [],
+  "requires_human_approval": false,
+  "is_critic": true
+}

@@ -1,0 +1,9 @@
+{
+  "name": "epic_story",
+  "parent": "solutioning",
+  "description": "Epic/Story Subagent - Requirements breakdown into epics and stories",
+  "max_tokens": 80000,
+  "timeout_seconds": 900,
+  "outputs": ["epics-stories.md"],
+  "requires_human_approval": false
+}

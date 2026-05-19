@@ -1,0 +1,9 @@
+{
+  "name": "brainstorm",
+  "parent": "analysis",
+  "description": "Brainstorm Subagent - Creative solution generation and evaluation",
+  "max_tokens": 80000,
+  "timeout_seconds": 900,
+  "outputs": ["brainstorm_results.md"],
+  "requires_human_approval": false
+}

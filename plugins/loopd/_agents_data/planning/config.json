@@ -1,0 +1,13 @@
+{
+  "name": "planning",
+  "description": "Planning Agent - PRD creation and UX design",
+  "max_tokens": 100000,
+  "timeout_seconds": 600,
+  "retry_on_failure": true,
+  "max_retries": 3,
+  "subagents": ["prd", "ux_design"],
+  "outputs": ["prd.md", "ux_design.md", "user_flows.excalidraw", "wireframes.excalidraw"],
+  "next_agent": "solutioning",
+  "can_escalate": true,
+  "requires_human_approval": false
+}

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "loopd-core"
+version = "0.1.0"
+description = "Deterministic FSM driver for the loopd Claude Code Plugin. Not published to PyPI — installed in-place from the plugin directory."
+requires-python = ">=3.11"
+authors = [{name = "BigggMorph", email = "biggg.morph@gmail.com"}]
+license = "MIT"
+dependencies = [
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "PyYAML>=6.0",
+]
+
+[project.scripts]
+loopd-tick = "loopd_core.tick:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["loopd_core"]

@@ -1,0 +1,12 @@
+{
+  "name": "research",
+  "parent": "analysis",
+  "description": "Research Subagent - 4-Phase iterative research with WebSearch/WebFetch integration",
+  "max_tokens": 150000,
+  "timeout_seconds": 900,
+  "tools": ["WebSearch", "WebFetch", "mcp__playwright__navigate", "mcp__playwright__get_visible_text", "mcp__playwright__screenshot", "mcp__playwright__get_snapshot"],
+  "max_web_searches": 15,
+  "max_web_fetches": 10,
+  "outputs": ["research_notes.md"],
+  "requires_human_approval": false
+}

@@ -1,0 +1,13 @@
+{
+  "name": "solutioning",
+  "description": "Solutioning Agent - Architecture design and epic/story breakdown",
+  "max_tokens": 100000,
+  "timeout_seconds": 600,
+  "retry_on_failure": true,
+  "max_retries": 3,
+  "subagents": ["architecture", "epic_story", "tech_spec"],
+  "outputs": ["architecture.md", "epics-stories.md", "data_model.md", "api_spec.md"],
+  "next_agent": "impl",
+  "can_escalate": true,
+  "requires_human_approval": false
+}

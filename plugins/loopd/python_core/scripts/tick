@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# loopd tick shim — invokes the Python entry point with the plugin's own
+# python_core directory on PYTHONPATH so no install step is required.
+set -euo pipefail
+
+if [[ -n "${CLAUDE_PLUGIN_ROOT:-}" ]]; then
+  PYTHON_CORE_DIR="${CLAUDE_PLUGIN_ROOT}/python_core"
+else
+  # Local development fallback: scripts/ is a sibling of loopd_core/
+  PYTHON_CORE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+fi
+
+export PYTHONPATH="${PYTHON_CORE_DIR}:${PYTHONPATH:-}"
+exec python3 -m loopd_core.tick "$@"

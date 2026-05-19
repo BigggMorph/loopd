@@ -1,0 +1,21 @@
+{
+  "name": "impl",
+  "description": "Implementation Agent - Code writing, testing, review, and refinement",
+  "max_tokens": 100000,
+  "timeout_seconds": 900,
+  "retry_on_failure": true,
+  "max_retries": 3,
+  "subagents": ["dev", "test", "review", "pr", "self_refine"],
+  "outputs": ["source_code", "tests", "documentation"],
+  "next_agent": null,
+  "can_escalate": true,
+  "requires_human_approval": false,
+  "quality_gate": {
+    "tests_pass": true,
+    "min_coverage": 80,
+    "no_lint_errors": true,
+    "no_type_errors": true,
+    "security_scan": true
+  },
+  "max_self_refine_iterations": 3
+}

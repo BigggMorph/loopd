@@ -1,0 +1,10 @@
+{
+  "name": "research_critic",
+  "parent": "analysis",
+  "description": "Research Critic — Evaluates research_notes.md against 5-axis quality rubric",
+  "max_tokens": 40000,
+  "timeout_seconds": 600,
+  "outputs": [],
+  "requires_human_approval": false,
+  "is_critic": true
+}

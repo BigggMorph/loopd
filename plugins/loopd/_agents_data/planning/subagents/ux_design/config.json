@@ -1,0 +1,9 @@
+{
+  "name": "ux_design",
+  "parent": "planning",
+  "description": "UX Design Subagent - User flows, wireframes, and interaction patterns",
+  "max_tokens": 80000,
+  "timeout_seconds": 400,
+  "outputs": ["ux_design.md", "user_flows.excalidraw", "wireframes.excalidraw"],
+  "requires_human_approval": false
+}

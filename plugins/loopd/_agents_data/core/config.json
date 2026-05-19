@@ -1,0 +1,11 @@
+{
+  "name": "core",
+  "description": "Core Agent - Task analysis, level determination, and routing",
+  "max_tokens": 50000,
+  "timeout_seconds": 120,
+  "retry_on_failure": true,
+  "max_retries": 2,
+  "outputs": ["level", "next_agent", "initial_context"],
+  "can_escalate": false,
+  "requires_human_approval": false
+}

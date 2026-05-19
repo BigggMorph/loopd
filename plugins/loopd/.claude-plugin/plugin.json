@@ -1,0 +1,9 @@
+{
+  "name": "loopd",
+  "version": "0.1.0",
+  "description": "Synchronous multi-phase dev task runner — Claude Code Plugin replacement for oh-my-agents. Planning → Implementation → Review in a single Claude Code window with workspace-isolated worktrees.",
+  "author": {
+    "name": "BigggMorph",
+    "email": "biggg.morph@gmail.com"
+  }
+}

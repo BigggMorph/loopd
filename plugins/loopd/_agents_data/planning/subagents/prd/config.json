@@ -1,0 +1,9 @@
+{
+  "name": "prd",
+  "parent": "planning",
+  "description": "PRD Subagent - Technology-agnostic product requirements documentation",
+  "max_tokens": 80000,
+  "timeout_seconds": 400,
+  "outputs": ["prd.md"],
+  "requires_human_approval": false
+}

@@ -1,0 +1,9 @@
+{
+  "name": "product_brief",
+  "parent": "analysis",
+  "description": "Product Brief Subagent - Comprehensive product documentation creation",
+  "max_tokens": 80000,
+  "timeout_seconds": 300,
+  "outputs": ["product_brief.md"],
+  "requires_human_approval": false
+}

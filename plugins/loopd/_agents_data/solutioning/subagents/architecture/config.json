@@ -1,0 +1,9 @@
+{
+  "name": "architecture",
+  "parent": "solutioning",
+  "description": "Architecture Subagent - System architecture and technology decisions",
+  "max_tokens": 80000,
+  "timeout_seconds": 900,
+  "outputs": ["architecture.md", "data_model.md", "api_spec.md"],
+  "requires_human_approval": false
+}

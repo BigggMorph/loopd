@@ -1,0 +1,9 @@
+{
+  "name": "tech_spec",
+  "parent": "solutioning",
+  "description": "Tech Spec Subagent - Detailed technical specifications for complex features",
+  "max_tokens": 80000,
+  "timeout_seconds": 900,
+  "outputs": ["tech_specs/*.md"],
+  "requires_human_approval": false
+}
