@@ -1,5 +1,5 @@
 """
-State management for oh-my-agents.
+State management for loopd.
 
 This package handles task state, locking, events, and queue management.
 """

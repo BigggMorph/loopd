@@ -33,7 +33,7 @@ hide-from-slash-command-tool: "true"
   "workspace_path": "/home/.../research-tasks/task-...",
   "task_type": "research",
   "github_issue": 1234,
-  "github_repo": "BigggMorph/oh-my-agents",
+  "github_repo": "BigggMorph/loopd",
   "next_action": {
     "kind": "invoke_subagent",
     "subagent_type": "research",

@@ -1,5 +1,5 @@
 """
-Agent routing for oh-my-agents.
+Agent routing for loopd.
 
 Determines which agent should handle a task based on level and state.
 """

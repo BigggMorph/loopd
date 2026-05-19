@@ -187,7 +187,7 @@ def parse_research_task_args(raw: str) -> dict[str, Any]:
 
     Example::
 
-        /research-task "AI agent frameworks 비교" repo:BigggMorph/oh-my-agents issue:1234
+        /research-task "AI agent frameworks 비교" repo:BigggMorph/loopd issue:1234
 
     ``repo:`` is optional unless ``issue:N`` is given (a GitHub Issue comment
     needs both owner and repo to address the issue).
@@ -219,7 +219,7 @@ def parse_research_task_args(raw: str) -> dict[str, Any]:
 # Routing — picks the next agent based on FSM + task state
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Phase 1 maps oh-my-agents' 5-agent pipeline (CORE → ANALYSIS → PLANNING →
+# Phase 1 maps the original 5-agent pipeline (CORE → ANALYSIS → PLANNING →
 # SOLUTIONING → IMPL) onto Issue #1174's 3-agent contract by collapsing
 # ANALYSIS+PLANNING+SOLUTIONING into a single "planning" subagent.
 _AGENT_PIPELINE = ["planning", "implementation", "review"]

@@ -1,5 +1,5 @@
 """
-Task management for oh-my-agents.
+Task management for loopd.
 
 Replaces lib/task.sh with a type-safe Python implementation.
 Maintains 100% compatibility with shell script task.json format.

@@ -1,5 +1,5 @@
 """
-Artifact management for oh-my-agents.
+Artifact management for loopd.
 
 Replaces artifact functions from lib/handoff.sh (L186-257).
 """
