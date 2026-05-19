@@ -6,13 +6,6 @@ Supersedes `oh-my-agents`'s daemon + Slack + Gateway architecture. Removes ~14k 
 
 ## Install
 
-**Local (development)**:
-```
-/plugin marketplace add /home/sungjin/Development/loopd
-/plugin install loopd@loopd
-```
-
-**From GitHub** (once published):
 ```
 /plugin marketplace add BigggMorph/loopd
 /plugin install loopd@loopd
