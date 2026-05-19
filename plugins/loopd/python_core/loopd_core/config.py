@@ -1,9 +1,8 @@
 """Configuration for loopd_core.
 
 Storage root defaults to ``~/.loopd/`` and can be overridden with the
-``LOOPD_ROOT`` environment variable. Slack/Gateway/daemon plumbing from the
-original oh-my-agents config is intentionally absent — the loopd plugin runs
-synchronously inside a Claude Code session.
+``LOOPD_ROOT`` environment variable. There is no Slack/Gateway/daemon
+plumbing — the loopd plugin runs synchronously inside a Claude Code session.
 """
 
 from __future__ import annotations

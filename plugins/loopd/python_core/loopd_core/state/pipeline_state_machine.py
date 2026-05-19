@@ -1,5 +1,5 @@
 """
-Pipeline State Machine (Layer 2 FSM) for oh-my-agents.
+Pipeline State Machine (Layer 2 FSM) for loopd.
 
 Implements strict phase control to prevent the dual-write race conditions
 described in PR #62:

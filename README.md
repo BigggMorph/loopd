@@ -2,7 +2,7 @@
 
 Claude Code Plugin for synchronous multi-phase dev tasks. Run planning → implementation → review in a single Claude Code window with workspace-isolated git worktrees.
 
-Supersedes `oh-my-agents`'s daemon + Slack + Gateway architecture. Removes ~14k LoC of infrastructure by relying on Claude Code's built-in subagents (via the `Task` tool) instead of `claude -p` subprocess calls.
+Relies on Claude Code's built-in subagents (via the `Task` tool) instead of `claude -p` subprocess calls, so no daemon, Slack bridge, or gateway is needed.
 
 ## Install
 
@@ -37,4 +37,4 @@ To pick up where a previous window left off:
 - `PostToolUse` hook records the subagent's result back into `tick --record`, which advances the FSM.
 - `Stop` hook re-invokes `tick` and injects the next action if the pipeline hasn't finished, so the window automatically continues.
 
-Storage lives under `~/.loopd/` (separate from `~/.oh-my-agents/`).
+Storage lives under `~/.loopd/`.

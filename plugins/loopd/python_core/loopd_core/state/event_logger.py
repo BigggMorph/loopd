@@ -1,5 +1,5 @@
 """
-Event logging for oh-my-agents.
+Event logging for loopd.
 
 Logs events to JSONL files (one per day) for debugging and auditing.
 Compatible with the shell script events.sh format.

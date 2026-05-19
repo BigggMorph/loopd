@@ -169,7 +169,7 @@ Create a structured comment with results:
 - **Suggested Fix**: Check async handling in process_task()
 
 ---
-🤖 Automated verification by oh-my-agents
+🤖 Automated verification by loopd
 ```
 
 ## Response Format

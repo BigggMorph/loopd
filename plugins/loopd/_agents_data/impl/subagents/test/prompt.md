@@ -79,7 +79,7 @@ Verifies import, instantiation, and primary operation without crashing.
 """
 import pytest
 
-from oh_my_agents.{module_path} import {ClassName}
+from loopd_core.{module_path} import {ClassName}
 
 
 @pytest.mark.smoke

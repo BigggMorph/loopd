@@ -47,4 +47,4 @@
 {{/if}}
 
 ---
-🤖 Automated verification by oh-my-agents | {{timestamp}}
+🤖 Automated verification by loopd | {{timestamp}}

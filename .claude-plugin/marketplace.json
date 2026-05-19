@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "loopd",
-      "description": "Run /dev-task to kick off a planning → implementation → review pipeline in the current Claude Code window. Replaces the oh-my-agents daemon + Slack architecture with synchronous, workspace-isolated execution.",
+      "description": "Run /dev-task to kick off a planning → implementation → review pipeline in the current Claude Code window. Synchronous, workspace-isolated execution — no daemon, no Slack bridge.",
       "author": {
         "name": "BigggMorph",
         "email": "biggg.morph@gmail.com"

@@ -1,18 +1,17 @@
 ---
-name: oma
+name: loopd
 description: |
-  loopd — synchronous multi-phase dev/research task runner. Supersedes
-  oh-my-agents' daemon + Slack + Gateway architecture by running the
+  loopd — synchronous multi-phase dev/research task runner. Runs the
   planning → implementation → review pipeline inside a single Claude Code
   window with workspace-isolated git worktrees. Trigger with /dev-task or
   /research-task; resume interrupted work with /resume-task.
 ---
 
-# loopd (oma migration)
+# loopd
 
-`loopd` packages the oh-my-agents pipeline as a Claude Code Plugin. Instead of
-calling `claude -p` from a Python daemon, the pipeline runs **inside Claude
-Code's own window** using the `Task` tool and FSM-driven hooks.
+`loopd` is a Claude Code Plugin that runs a multi-phase dev/research pipeline
+**inside Claude Code's own window** using the `Task` tool and FSM-driven hooks
+— no separate daemon or subprocess invocation of `claude -p`.
 
 ## When to invoke
 

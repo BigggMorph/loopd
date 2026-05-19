@@ -1,5 +1,5 @@
 """
-Core type definitions for oh-my-agents.
+Core type definitions for loopd.
 
 Pydantic models that match the task.json schema used by the shell scripts,
 ensuring 100% compatibility with existing functionality.
