@@ -25,3 +25,6 @@ Thumbs.db
 # Logs / local state
 *.log
 .claude/
+
+# loopd pipeline internal artifacts (per-task planning/research outputs)
+_loopd/
