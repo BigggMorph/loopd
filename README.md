@@ -15,6 +15,33 @@ Relies on Claude Code's built-in subagents (via the `Task` tool) instead of `cla
 
 Requirements: `python3.11+`, `git`, `gh` CLI.
 
+### Troubleshooting
+
+**`ModuleNotFoundError: No module named 'pydantic'` on first run**
+
+`/plugin install` lays down the plugin files but Claude Code marketplaces
+have no post-install hook, so loopd's Python deps (`pydantic`,
+`pydantic-settings`, `PyYAML`) need a one-time install. The plugin's
+`tick` shim will try to handle this automatically on first invocation; if it
+fails, run the install manually against the **same interpreter** that
+`tick` will use:
+
+```bash
+python3 -m pip install --break-system-packages \
+  'pydantic>=2.0' 'pydantic-settings>=2.0' 'PyYAML>=6.0'
+```
+
+If your system has Homebrew Python and `pip3` resolves to a different
+interpreter than `python3`, always invoke `python3 -m pip ...`, not `pip3`.
+
+**Environment overrides**
+
+- `LOOPD_PYTHON` — absolute path to a Python 3.11+ interpreter (e.g.
+  pointing at a venv). Defaults to `python3`.
+- `LOOPD_SKIP_BOOTSTRAP=1` — disables the auto-install probe entirely. Use
+  this when you manage deps yourself (poetry, venv, conda, ...).
+- `LOOPD_ROOT` — where loopd stores its state (default `~/.loopd`).
+
 ## Usage
 
 ```

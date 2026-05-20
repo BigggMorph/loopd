@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # loopd tick shim — invokes the Python entry point with the plugin's own
-# python_core directory on PYTHONPATH so no install step is required.
+# python_core directory on PYTHONPATH, and self-bootstraps Python deps on
+# first run because Claude Code plugin marketplaces have no install hook.
+# See: https://github.com/BigggMorph/loopd/issues/2
 set -euo pipefail
 
 if [[ -n "${CLAUDE_PLUGIN_ROOT:-}" ]]; then
@@ -10,5 +12,93 @@ else
   PYTHON_CORE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fi
 
+PY="${LOOPD_PYTHON:-python3}"
+LOOPD_ROOT_DIR="${LOOPD_ROOT:-${HOME}/.loopd}"
+MARKER="${LOOPD_ROOT_DIR}/.bootstrap_ok"
+
+# Keep in sync with python_core/pyproject.toml [project.dependencies].
+LOOPD_DEPS=('pydantic>=2.0' 'pydantic-settings>=2.0' 'PyYAML>=6.0')
+LOOPD_IMPORT_PROBE='import pydantic, pydantic_settings, yaml'
+
+_loopd_log() { printf '%s\n' "[loopd] $*" >&2; }
+
+_loopd_resolve_python() {
+  if ! command -v "$PY" >/dev/null 2>&1; then
+    _loopd_log "python interpreter not found: $PY"
+    _loopd_log "Set LOOPD_PYTHON to an absolute path of a Python 3.11+ binary."
+    exit 1
+  fi
+}
+
+_loopd_marker_matches() {
+  [[ -f "$MARKER" ]] || return 1
+  local resolved
+  resolved="$("$PY" -c 'import sys;print(sys.executable)' 2>/dev/null || true)"
+  [[ -n "$resolved" ]] || return 1
+  # Grep for the resolved path in the JSON marker. Cheap, no jq dep.
+  grep -Fq "\"python\":\"$resolved\"" "$MARKER" 2>/dev/null
+}
+
+_loopd_write_marker() {
+  local resolved iso
+  resolved="$("$PY" -c 'import sys;print(sys.executable)' 2>/dev/null || true)"
+  iso="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+  mkdir -p "$LOOPD_ROOT_DIR" 2>/dev/null || return 0
+  printf '{"python":"%s","checked_at":"%s","version":"0.1.0"}\n' \
+    "$resolved" "$iso" > "$MARKER" 2>/dev/null || \
+    _loopd_log "warning: could not write $MARKER (continuing)"
+}
+
+_loopd_pip_install() {
+  # First attempt: --user (least invasive, works on most systems).
+  if "$PY" -m pip install --user --quiet --disable-pip-version-check \
+        "${LOOPD_DEPS[@]}" >&2; then
+    return 0
+  fi
+  # Fallback: --break-system-packages (PEP 668 distros, Homebrew Python 3.12+).
+  if "$PY" -m pip install --break-system-packages --quiet \
+        --disable-pip-version-check "${LOOPD_DEPS[@]}" >&2; then
+    return 0
+  fi
+  return 1
+}
+
+_loopd_bootstrap() {
+  [[ "${LOOPD_SKIP_BOOTSTRAP:-0}" == "1" ]] && return 0
+  _loopd_resolve_python
+
+  if _loopd_marker_matches; then
+    return 0
+  fi
+
+  if "$PY" -c "$LOOPD_IMPORT_PROBE" >/dev/null 2>&1; then
+    _loopd_write_marker
+    return 0
+  fi
+
+  _loopd_log "Installing Python dependencies for $($PY -V 2>&1) ..."
+  if ! _loopd_pip_install; then
+    _loopd_log "Failed to install loopd Python dependencies automatically."
+    _loopd_log "Run this manually and try again:"
+    _loopd_log "  $PY -m pip install --break-system-packages \\"
+    _loopd_log "    'pydantic>=2.0' 'pydantic-settings>=2.0' 'PyYAML>=6.0'"
+    _loopd_log "Or set LOOPD_SKIP_BOOTSTRAP=1 if you manage deps yourself."
+    _loopd_log "See README → Troubleshooting for more options."
+    exit 1
+  fi
+
+  # Re-probe to confirm the install actually took effect under $PY.
+  if ! "$PY" -c "$LOOPD_IMPORT_PROBE" >/dev/null 2>&1; then
+    _loopd_log "Install reported success but imports still fail under $PY."
+    _loopd_log "This usually means pip targeted a different interpreter."
+    _loopd_log "Set LOOPD_PYTHON to an absolute path and retry."
+    exit 1
+  fi
+
+  _loopd_write_marker
+}
+
+_loopd_bootstrap
+
 export PYTHONPATH="${PYTHON_CORE_DIR}:${PYTHONPATH:-}"
-exec python3 -m loopd_core.tick "$@"
+exec "$PY" -m loopd_core.tick "$@"
