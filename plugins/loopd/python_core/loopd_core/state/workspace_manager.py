@@ -266,6 +266,7 @@ class WorkspaceManager:
         repo_url: str,
         base_branch: str = "main",
         base_commit: Optional[str] = None,
+        force: bool = False,
     ) -> Path:
         """
         Create a git worktree for a task.
@@ -276,12 +277,17 @@ class WorkspaceManager:
         If base_commit is provided, the worktree is checked out at that specific
         commit instead of the tip of base_branch (used for SWE-bench evaluation).
 
+        If force is False (default), the call raises WorkspaceError when a
+        worktree or branch for ``task_id`` already exists, preventing silent
+        destruction of an in-flight Claude Code window's work. Pass
+        force=True (e.g. via force_recreate_workspace) when intentional.
+
         Returns the worktree path.
         """
         lock_id = self._worktree_lock_id(repo_url)
         with self.lock_manager.lock(lock_id, timeout=self.WORKTREE_LOCK_TIMEOUT):
             return self._create_task_worktree_impl(
-                task_id, repo_url, base_branch, base_commit,
+                task_id, repo_url, base_branch, base_commit, force=force,
             )
 
     def _create_task_worktree_impl(
@@ -290,6 +296,7 @@ class WorkspaceManager:
         repo_url: str,
         base_branch: str = "main",
         base_commit: Optional[str] = None,
+        force: bool = False,
     ) -> Path:
         """Internal worktree creation — caller must already hold the lock."""
         # Ensure bare repo exists
@@ -304,7 +311,16 @@ class WorkspaceManager:
         branch_name = self.ws_config.branch_pattern.replace("{task_id}", task_id)
 
         if worktree_path.is_dir():
-            logger.info(f"Stale worktree found, removing for fresh creation: {worktree_path}")
+            if not force:
+                raise WorkspaceError(
+                    f"worktree already exists for task '{task_id}' at "
+                    f"{worktree_path}; refusing to overwrite. "
+                    "Pass force=True (e.g. via force_recreate_workspace) "
+                    "if this is intentional."
+                )
+            logger.info(
+                f"force=True: removing existing worktree at {worktree_path}"
+            )
             self.remove_task_worktree(task_id, repo_url)
             # Fall through to fresh creation below
 
@@ -314,15 +330,24 @@ class WorkspaceManager:
         # Prune stale worktree references
         self._run_git(["worktree", "prune"], cwd=bare_path, check=False)
 
-        # Delete existing branch if present (from a previous run)
-        result = self._run_git(
+        # Refuse to silently delete an existing branch — that would throw
+        # away any unpushed commits another Claude Code window made.
+        branch_exists = self._run_git(
             ["show-ref", "--verify", "--quiet", f"refs/heads/{branch_name}"],
             cwd=bare_path,
             check=False,
-        )
-        if result.returncode == 0:
-            logger.info(f"Branch already exists, deleting: {branch_name}")
-            self._run_git(["branch", "-D", branch_name], cwd=bare_path, check=False)
+        ).returncode == 0
+        if branch_exists:
+            if not force:
+                raise WorkspaceError(
+                    f"branch '{branch_name}' already exists in {bare_path}; "
+                    "refusing to delete. Pass force=True "
+                    "(e.g. via force_recreate_workspace) if this is intentional."
+                )
+            logger.info(f"force=True: deleting existing branch {branch_name}")
+            self._run_git(
+                ["branch", "-D", branch_name], cwd=bare_path, check=False,
+            )
 
         # Determine the starting ref: specific commit (SWE-bench) or branch tip
         if base_commit:
@@ -456,9 +481,11 @@ class WorkspaceManager:
             # Explicitly remove existing worktree
             self.remove_task_worktree(task_id, repo_url)
 
-            # Create fresh worktree (use _impl to avoid re-acquiring lock)
+            # Create fresh worktree (use _impl to avoid re-acquiring lock).
+            # force=True preserves the legacy "wipe + recreate" semantics
+            # that callers of force_recreate_workspace rely on.
             return self._create_task_worktree_impl(
-                task_id, repo_url, base_branch,
+                task_id, repo_url, base_branch, force=True,
             )
 
     # ─── Git operations in worktree ───
