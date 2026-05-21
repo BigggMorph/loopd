@@ -6,31 +6,47 @@ Claude session has an active loopd task, and the tool being invoked is
 ``Task``, verify that ``subagent_type`` and the SHA256 of ``prompt`` match
 what ``tick.py`` last emitted. Mismatch → exit 2 with stderr explanation
 (Claude Code surfaces this to the LLM as a self-correction prompt).
+
+Bootstrap path: when ``tick init`` runs from a slash-command bash
+sub-shell it cannot see Claude Code's session UUID, so it writes a
+"pending claim" file under ``~/.loopd/sessions/.pending/<task_id>.json``
+instead of a real session file. The first time *this* window's main LLM
+invokes ``Task`` after ``tick init`` (PreToolUse fires with the real
+``payload.session_id``), we look for a pending file whose prompt SHA256
+matches the actual ``tool_input.prompt`` and atomically promote it to
+``~/.loopd/sessions/<payload.session_id>.json``. Subsequent hooks then
+resolve that file by exact UUID match — no cwd-hash fallback exists.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import os
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _loopd_hook_lib import ensure_loopd_core_importable  # noqa: E402
+
+ensure_loopd_core_importable()
+from loopd_core import session_store  # noqa: E402
+
 
 def _resolve_session(payload_session_id: str):
-    """Locate the loopd session file regardless of which session_id scheme is in
-    play: prefer Claude Code's UUID (if tick was launched with LOOPD_SESSION_ID
-    set), then fall back to tick.py's cwd-hash naming.
+    """Locate the loopd session file by exact CC UUID match.
+
+    No cwd-hash fallback — when the UUID-keyed file does not exist, return
+    ``(None, None)`` so the caller can either attempt a pending-claim
+    bootstrap (PreToolUse only) or no-op.
     """
-    sessions_dir = Path.home() / ".loopd" / "sessions"
-    if payload_session_id:
-        f = sessions_dir / f"{payload_session_id}.json"
-        if f.exists():
-            return payload_session_id, f
-    cwd_sid = "cwd-" + hashlib.sha256(str(Path.cwd().resolve()).encode()).hexdigest()[:16]
-    f = sessions_dir / f"{cwd_sid}.json"
-    if f.exists():
-        return cwd_sid, f
+    if not payload_session_id:
+        return None, None
+    try:
+        path = session_store.session_path_for(payload_session_id)
+    except ValueError:
+        return None, None
+    if path.exists():
+        return payload_session_id, path
     return None, None
 
 
@@ -41,7 +57,28 @@ def main() -> int:
     except json.JSONDecodeError:
         return 0  # malformed input — let it pass
 
-    _, session_file = _resolve_session(payload.get("session_id") or "")
+    sid = payload.get("session_id") or ""
+    resolved_sid, session_file = _resolve_session(sid)
+
+    # Bootstrap: first Task invocation after `tick init`. No UUID-keyed
+    # session file exists yet, but a pending claim may. Try to claim it by
+    # matching the prompt SHA256 — the Task tool doesn't expose
+    # validation_token as a field, but prompt SHA256 uniquely identifies
+    # the next_action that tick just minted.
+    if (
+        session_file is None
+        and sid
+        and payload.get("tool_name") in ("Task", "Agent")
+    ):
+        tool_input = payload.get("tool_input") or {}
+        actual_prompt = tool_input.get("prompt", "")
+        if actual_prompt:
+            actual_hash = hashlib.sha256(actual_prompt.encode()).hexdigest()
+            claimed = session_store.claim_pending_by_prompt_hash(actual_hash, sid)
+            if claimed is not None:
+                session_file = claimed
+                resolved_sid = sid
+
     if session_file is None:
         return 0
 

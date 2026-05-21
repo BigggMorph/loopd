@@ -25,6 +25,14 @@ hide-from-slash-command-tool: "true"
 "${CLAUDE_PLUGIN_ROOT}/python_core/scripts/tick" init --args "$ARGUMENTS"
 ```
 
+> 메모: `tick init`은 슬래시 명령의 bash 서브셸에서 실행되므로 Claude Code의
+> 세션 UUID를 직접 보지 못합니다. 이 시점에서는 `~/.loopd/sessions/<uuid>.json`이
+> 아직 만들어지지 않고, 대신 `~/.loopd/sessions/.pending/<task_id>.json`에
+> "pending claim" 파일이 잠깐 저장됩니다. 다음 단계에서 Step 2의 첫 `Task`
+> 호출 직전에 PreToolUse hook이 실제 세션 UUID로 이 파일을 청구(claim)해
+> `~/.loopd/sessions/<uuid>.json`으로 옮깁니다 — 그 후의 모든 hook은 이
+> UUID로만 세션을 찾습니다. (cwd 해시 fallback은 제거되었습니다.)
+
 응답은 정확히 다음 형태의 JSON 1줄입니다:
 
 ```json

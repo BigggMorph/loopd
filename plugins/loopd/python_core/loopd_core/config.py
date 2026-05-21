@@ -110,6 +110,10 @@ class Config(BaseSettings):
         return self.loopd_root / "sessions"
 
     @property
+    def pending_sessions_path(self) -> Path:
+        return self.sessions_path / ".pending"
+
+    @property
     def agents_path(self) -> Path:
         return self.plugin_root / "_agents_data"
 
@@ -152,6 +156,7 @@ class Config(BaseSettings):
         self.workspaces_path.mkdir(parents=True, exist_ok=True)
         self.repos_path.mkdir(parents=True, exist_ok=True)
         self.sessions_path.mkdir(parents=True, exist_ok=True)
+        self.pending_sessions_path.mkdir(parents=True, exist_ok=True)
         self.artifacts_path.mkdir(parents=True, exist_ok=True)
         self.events_path.mkdir(parents=True, exist_ok=True)
 

@@ -42,6 +42,17 @@ interpreter than `python3`, always invoke `python3 -m pip ...`, not `pip3`.
   this when you manage deps yourself (poetry, venv, conda, ...).
 - `LOOPD_ROOT` — where loopd stores its state (default `~/.loopd`).
 
+**Upgrading from a pre-fix build with active sessions?** Older builds wrote
+session files named `~/.loopd/sessions/cwd-<hash>.json` (keyed by the
+working-directory hash, which caused cross-window task hijacking — see
+issue #4). The new build keys sessions strictly by the Claude Code session
+UUID and ignores any leftover `cwd-*.json` files. You can safely delete
+them after upgrading:
+
+```bash
+rm ~/.loopd/sessions/cwd-*.json
+```
+
 ## Usage
 
 ```
