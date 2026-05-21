@@ -46,53 +46,29 @@ logger = logging.getLogger("loopd.tick")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Session file — per-Claude-session state under ~/.loopd/sessions/<id>.json
+# Session file — per-Claude-session state under ~/.loopd/sessions/<uuid>.json
+#
+# Sessions are now strictly keyed by the Claude Code session UUID — the
+# previous cwd-hash fallback has been removed (it caused cross-window leaks
+# when two CC windows opened the same project). When the UUID is unknown
+# (e.g. `tick init` from a slash-command bash sub-shell), tick.py writes a
+# deferred "pending claim" file via session_store.write_pending(); the first
+# PreToolUse hook in the originator window claims it under its own UUID.
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _session_id() -> str:
-    """Determine the session identifier.
+def _session_id() -> Optional[str]:
+    """Return the current Claude Code session UUID, or ``None`` when unknown.
 
-    Priority:
-    1. ``LOOPD_SESSION_ID`` env (set by hooks from the Claude Code session_id)
-    2. ``CLAUDE_SESSION_ID`` env (older variants)
-    3. Fall back to the cwd hash so single-window dev still works.
+    Callers that *require* a session id must error out on ``None`` rather
+    than fall back to a cwd-derived value. The legacy ``cwd-<hash>`` form is
+    intentionally not produced anywhere in the new code path.
     """
-    sid = os.environ.get("LOOPD_SESSION_ID") or os.environ.get("CLAUDE_SESSION_ID")
-    if sid:
-        return sid
-    return "cwd-" + hashlib.sha256(str(Path.cwd().resolve()).encode()).hexdigest()[:16]
-
-
-def _session_file() -> Path:
-    from loopd_core.config import get_config
-
-    cfg = get_config()
-    cfg.sessions_path.mkdir(parents=True, exist_ok=True)
-    return cfg.sessions_path / f"{_session_id()}.json"
-
-
-def _read_session() -> dict[str, Any]:
-    f = _session_file()
-    if not f.exists():
-        return {}
-    try:
-        return json.loads(f.read_text())
-    except Exception:
-        return {}
-
-
-def _write_session(data: dict[str, Any]) -> None:
-    f = _session_file()
-    tmp = f.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2, default=str))
-    os.replace(tmp, f)
-
-
-def _delete_session() -> None:
-    f = _session_file()
-    if f.exists():
-        f.unlink()
+    return (
+        os.environ.get("LOOPD_SESSION_ID")
+        or os.environ.get("CLAUDE_SESSION_ID")
+        or None
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -569,13 +545,46 @@ def _build_next_action(task_dict: dict[str, Any], workspace_path: Path) -> dict[
 
 
 def _persist_session_for_action(task_id: str, next_action: dict[str, Any]) -> None:
-    session = _read_session()
-    session["task_id"] = task_id
-    session["last_next_action"] = next_action
-    _write_session(session)
+    """Persist next_action for the current session.
+
+    If we have a real CC session UUID, write the canonical session file at
+    ``sessions/<sid>.json``. Otherwise (e.g. invoked from a slash-command
+    bash sub-shell that doesn't see Claude Code's UUID), defer to a
+    "pending claim" file under ``sessions/.pending/<task_id>.json`` — the
+    first PreToolUse hook in the originator window will atomically claim
+    that file under its own session UUID.
+    """
+    from loopd_core import session_store
+
+    sid = _session_id()
+    if sid:
+        existing = session_store.read_session(sid)
+        existing["task_id"] = task_id
+        existing["last_next_action"] = next_action
+        session_store.write_session(sid, existing)
+        return
+
+    session_store.write_pending(
+        task_id,
+        {
+            "task_id": task_id,
+            "validation_token": next_action.get("validation_token"),
+            "next_action": next_action,
+        },
+    )
 
 
 def cmd_init(args: argparse.Namespace) -> int:
+    # Opportunistic GC of crashed/abandoned pending claims so the directory
+    # doesn't grow without bound across long-lived installs.
+    try:
+        from loopd_core import session_store
+
+        session_store.cleanup_stale_pending(86400)
+    except Exception:
+        # GC is best-effort; never block task init on it.
+        pass
+
     task_type = getattr(args, "type", "dev") or "dev"
     if task_type == "research":
         return _cmd_init_research(args)
@@ -704,7 +713,13 @@ def _resolve_task_and_workspace(task_id: str) -> tuple[dict[str, Any], Path]:
 
 
 def cmd_tick(args: argparse.Namespace) -> int:
-    session = _read_session()
+    from loopd_core import session_store
+
+    sid = _session_id()
+    if not sid:
+        return _emit_error("no active loopd task — run /dev-task first", exit_code=2)
+
+    session = session_store.read_session(sid)
     task_id = session.get("task_id")
     if not task_id:
         return _emit_error("no active loopd task — run /dev-task first", exit_code=2)
@@ -724,6 +739,8 @@ def cmd_tick(args: argparse.Namespace) -> int:
 
 
 def cmd_record(args: argparse.Namespace) -> int:
+    from loopd_core import session_store
+
     payload_text = sys.stdin.read()
     if not payload_text.strip():
         return _emit_error("--record requires JSON on stdin", exit_code=2)
@@ -733,7 +750,15 @@ def cmd_record(args: argparse.Namespace) -> int:
     except json.JSONDecodeError as e:
         return _emit_error(f"invalid JSON: {e}", exit_code=2)
 
-    session = _read_session()
+    sid = _session_id()
+    if not sid:
+        return _emit_error(
+            "--record requires a Claude Code session id; ensure the hook "
+            "exports LOOPD_SESSION_ID",
+            exit_code=2,
+        )
+
+    session = session_store.read_session(sid)
     if not verify_token(payload.get("validation_token", ""), session):
         return _emit_error("validation token mismatch — refusing to record", exit_code=2)
 
@@ -808,7 +833,7 @@ def cmd_record(args: argparse.Namespace) -> int:
     next_action = _build_next_action(task_dict, workspace_path)
     if next_action["kind"] == "complete":
         sm.complete_pipeline()
-        _delete_session()
+        session_store.delete_session(sid)
     else:
         _persist_session_for_action(task_id, next_action)
 
@@ -820,6 +845,14 @@ def cmd_record(args: argparse.Namespace) -> int:
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
+    sid = _session_id()
+    if not sid:
+        return _emit_error(
+            "--resume requires a Claude Code session id; run `tick resume` from "
+            "the CC window you want to bind to the task, not a detached shell",
+            exit_code=2,
+        )
+
     task_id = args.task_id
     try:
         task_dict, workspace_path = _resolve_task_and_workspace(task_id)

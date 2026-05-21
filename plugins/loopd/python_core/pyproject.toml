@@ -15,8 +15,14 @@ dependencies = [
     "PyYAML>=6.0",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
 [project.scripts]
 loopd-tick = "loopd_core.tick:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["loopd_core"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

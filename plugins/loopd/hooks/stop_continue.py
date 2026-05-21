@@ -3,31 +3,41 @@
 
 If the FSM has not finished, write a JSON instruction back to stdout telling
 Claude Code to block the stop and feed a continuation prompt to the main LLM.
+
+Resolution: strict CC UUID match — no cwd-hash fallback. If this window did
+not originate the task (no ``sessions/<payload.session_id>.json`` exists),
+the hook is a no-op and **does not emit** ``decision: "block"``.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _loopd_hook_lib import ensure_loopd_core_importable  # noqa: E402
+
+ensure_loopd_core_importable()
+from loopd_core import session_store  # noqa: E402
+
 
 def _resolve_session(payload_session_id: str):
-    """See pretool_validate._resolve_session — fallback to tick.py's cwd-hash
-    naming when the slash-command Bash sub-shell did not see CLAUDE_SESSION_ID.
+    """Locate the loopd session file by exact CC UUID match.
+
+    Returns ``(None, None)`` when no matching session exists for this window
+    — strictly no cwd-hash fallback.
     """
-    sessions_dir = Path.home() / ".loopd" / "sessions"
-    if payload_session_id:
-        f = sessions_dir / f"{payload_session_id}.json"
-        if f.exists():
-            return payload_session_id, f
-    cwd_sid = "cwd-" + hashlib.sha256(str(Path.cwd().resolve()).encode()).hexdigest()[:16]
-    f = sessions_dir / f"{cwd_sid}.json"
-    if f.exists():
-        return cwd_sid, f
+    if not payload_session_id:
+        return None, None
+    try:
+        path = session_store.session_path_for(payload_session_id)
+    except ValueError:
+        return None, None
+    if path.exists():
+        return payload_session_id, path
     return None, None
 
 
