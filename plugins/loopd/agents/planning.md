@@ -23,7 +23,7 @@ color: blue
    - `architecture.md` — 어떤 모듈/파일을 추가/수정하는지, 데이터 흐름, 의존성
    - `plan.md` — Implementation 단계가 곧바로 실행할 수 있는 step-by-step 작업 목록
 4. UI 변경이 있으면 `ux.md`에 화면 흐름과 컴포넌트 명세 추가.
-5. 변경 사항을 `git add` + `git commit`으로 커밋. 커밋 메시지: `plan: <짧은 요약>`.
+5. `_loopd/{{TASK_ID}}/` 산출물은 `.gitignore` 대상 — **commit 금지**. Implementation 단계가 동일 worktree에서 직접 Read하고, PR body로 plan을 노출합니다.
 
 ## 출력 규약 (필수)
 
