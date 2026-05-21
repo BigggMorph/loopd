@@ -38,3 +38,32 @@ To pick up where a previous window left off:
 - `Stop` hook re-invokes `tick` and injects the next action if the pipeline hasn't finished, so the window automatically continues.
 
 Storage lives under `~/.loopd/`.
+
+## Updating
+
+End users:
+
+```
+/plugin update loopd
+```
+
+Claude Code decides "is there a new version?" by reading the `version` field in `plugins/loopd/.claude-plugin/plugin.json` — **not** git commits or tags. So pushing new commits without bumping that field has no effect. If you need to force-refresh the same version:
+
+```
+/plugin uninstall loopd
+/plugin install loopd@loopd
+```
+
+## Releasing (maintainers)
+
+Versioning is driven by GitHub Releases via [`.github/workflows/sync-plugin-version.yml`](.github/workflows/sync-plugin-version.yml):
+
+1. Publish a GitHub Release with a semver tag (e.g. `v0.2.0` or `0.2.0`).
+2. The workflow strips the leading `v`, writes the version into `plugins/loopd/.claude-plugin/plugin.json`, and commits back to `main` as `github-actions[bot]`.
+3. End users get the new version on their next `/plugin update loopd`.
+
+Notes:
+
+- The release tag must match semver (`X.Y.Z`, optionally with `-pre` / `+build` suffix). Non-semver tags fail the workflow.
+- The release event only fires on release creation, so the bot-pushed commit will not retrigger the workflow — no infinite loop.
+- If `plugin.json` is already at the target version (e.g. you bumped it manually in the same PR that became the release), the workflow no-ops.
