@@ -214,6 +214,45 @@ def test_claim_pending_by_prompt_hash_empty_inputs_returns_none():
     assert session_store.claim_pending_by_prompt_hash("hash", "") is None
 
 
+def test_claim_pending_by_prompt_hash_respects_per_task_lock():
+    """When another process already holds the per-task flock, a concurrent
+    claim attempt for the same pending file must skip rather than racing on
+    the write_session+unlink compound (plan Step 5 race-safety hardening).
+    Skipped gracefully on platforms without ``fcntl``.
+    """
+    from loopd_core import session_store
+
+    if session_store._fcntl is None:  # pragma: no cover — Windows
+        import pytest
+
+        pytest.skip("fcntl not available on this platform")
+
+    task_id = "task-test-lock-001"
+    prompt_hash = "deadbeef-lock-test"
+    session_store.write_pending(
+        task_id,
+        {
+            "task_id": task_id,
+            "validation_token": "tok-lock",
+            "next_action": {"kind": "invoke_subagent", "prompt_sha256": prompt_hash},
+        },
+    )
+
+    # Hold the lock from outside; claim_pending_by_prompt_hash should bail.
+    with session_store._pending_claim_lock(task_id) as acquired:
+        assert acquired is True
+        result = session_store.claim_pending_by_prompt_hash(prompt_hash, "uuid-lock")
+        assert result is None
+        # Pending must be untouched while the lock is held.
+        assert session_store.pending_path_for(task_id).exists()
+
+    # After the lock is released, the next attempt succeeds.
+    target = session_store.claim_pending_by_prompt_hash(prompt_hash, "uuid-lock")
+    assert target is not None
+    assert target.exists()
+    assert not session_store.pending_path_for(task_id).exists()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # cleanup_stale_pending
 # ─────────────────────────────────────────────────────────────────────────────

@@ -845,6 +845,14 @@ def cmd_record(args: argparse.Namespace) -> int:
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
+    sid = _session_id()
+    if not sid:
+        return _emit_error(
+            "--resume requires a Claude Code session id; run `tick resume` from "
+            "the CC window you want to bind to the task, not a detached shell",
+            exit_code=2,
+        )
+
     task_id = args.task_id
     try:
         task_dict, workspace_path = _resolve_task_and_workspace(task_id)

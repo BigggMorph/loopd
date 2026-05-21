@@ -15,12 +15,18 @@ Layout under ``~/.loopd/sessions/``::
 
 from __future__ import annotations
 
+import contextlib
 import hmac
 import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
+
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover — Windows / non-POSIX
+    _fcntl = None  # type: ignore[assignment]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -72,6 +78,45 @@ def pending_path_for(task_id: str) -> Path:
     if not task_id:
         raise ValueError("pending_path_for: task_id must be a non-empty string")
     return _pending_dir() / f"{task_id}.json"
+
+
+def _pending_lock_path_for(task_id: str) -> Path:
+    return _pending_dir() / f".{task_id}.lock"
+
+
+@contextlib.contextmanager
+def _pending_claim_lock(task_id: str) -> Iterator[bool]:
+    """Per-task advisory lock around pending-file claim operations.
+
+    Acquires ``fcntl.flock`` (LOCK_EX | LOCK_NB) on
+    ``~/.loopd/sessions/.pending/.<task_id>.lock``. Yields ``True`` when the
+    lock was acquired, ``False`` when another process holds it (caller should
+    skip this entry). On platforms without ``fcntl`` (e.g. Windows) the
+    context is a best-effort no-op that always yields ``True``.
+    """
+    if _fcntl is None:
+        yield True
+        return
+
+    lock_path = _pending_lock_path_for(task_id)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            with contextlib.suppress(OSError):
+                _fcntl.flock(fd, _fcntl.LOCK_UN)
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        with contextlib.suppress(FileNotFoundError):
+            lock_path.unlink()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -184,17 +229,32 @@ def claim_pending_by_prompt_hash(prompt_sha256: str, sid: str) -> Optional[Path]
         na = data.get("next_action") or {}
         if na.get("prompt_sha256") != prompt_sha256:
             continue
-        target = session_path_for(sid)
-        try:
+
+        task_id = data.get("task_id") or p.stem
+        with _pending_claim_lock(task_id) as acquired:
+            if not acquired:
+                continue
+            # Re-check after acquiring the lock — another window may have
+            # promoted this pending file between glob() and the lock.
+            if not p.exists():
+                continue
+            try:
+                data = json.loads(p.read_text())
+            except Exception:
+                continue
+            na = data.get("next_action") or {}
+            if na.get("prompt_sha256") != prompt_sha256:
+                continue
             session_payload = {
-                "task_id": data.get("task_id"),
+                "task_id": data.get("task_id") or task_id,
                 "last_next_action": na,
             }
-            write_session(sid, session_payload)
-            p.unlink()
-        except FileNotFoundError:
-            return None
-        return target
+            try:
+                write_session(sid, session_payload)
+                p.unlink()
+            except FileNotFoundError:
+                return None
+            return session_path_for(sid)
     return None
 
 

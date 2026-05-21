@@ -133,6 +133,23 @@ def test_record_errors_without_session_id(monkeypatch, capsys):
     assert "session id" in combined.lower() or "no active" in combined.lower()
 
 
+def test_resume_errors_without_session_id(monkeypatch, capsys):
+    """`tick resume <task_id>` must hard-error when LOOPD_SESSION_ID is
+    missing instead of silently writing a pending claim under the task_id —
+    otherwise any window whose Task prompt hashes to the resumed action
+    could claim the wrong session (plan Step 3.7 / AC-6).
+    """
+    from loopd_core import tick
+
+    ns = argparse.Namespace(task_id="task-2026-05-21-001")
+    rc = tick.cmd_resume(ns)
+    assert rc == 2
+
+    combined = capsys.readouterr()
+    combined_text = combined.out + combined.err
+    assert "session id" in combined_text.lower()
+
+
 class _StdinStub:
     """Minimal stdin stand-in that returns a fixed string from read()."""
 
