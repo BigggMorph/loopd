@@ -178,39 +178,46 @@ class TaskManager:
                 if not self.task_exists(dep_id):
                     raise ValueError(f"Dependency task not found: {dep_id}")
 
-        task_id = self._generate_task_id()
-        now = self._now_iso()
+        # Serialize task_id generation + pending JSON write to prevent two
+        # concurrent /dev-task windows from picking the same NNN sequence.
+        # The bucket is per-day because _generate_task_id only scans for
+        # today's date prefix; cross-day callers cannot collide.
+        lock_key = f"task-create-{datetime.now().strftime('%Y-%m-%d')}"
+        with self.lock_manager.lock(lock_key):
+            task_id = self._generate_task_id()
+            now = self._now_iso()
 
-        task = Task(
-            id=task_id,
-            prompt=prompt,
-            title=title,
-            level=level,
-            priority=priority,
-            task_type=task_type,
-            status=TaskStatus.PENDING,
-            source=TaskSource(type=source_type, ref=source_ref),
-            state=TaskState(),
-            requester_slack_id=(metadata or {}).get("slack_user_id"),
-            context=TaskContext(),
-            autonomy_log=AutonomyLog(),
-            history=[],
-            artifacts=[],
-            metadata=metadata or {},
-            depends_on=depends_on or [],
-            created_at=datetime.now(timezone.utc),
-            updated_at=datetime.now(timezone.utc),
-        )
+            task = Task(
+                id=task_id,
+                prompt=prompt,
+                title=title,
+                level=level,
+                priority=priority,
+                task_type=task_type,
+                status=TaskStatus.PENDING,
+                source=TaskSource(type=source_type, ref=source_ref),
+                state=TaskState(),
+                requester_slack_id=(metadata or {}).get("slack_user_id"),
+                context=TaskContext(),
+                autonomy_log=AutonomyLog(),
+                history=[],
+                artifacts=[],
+                metadata=metadata or {},
+                depends_on=depends_on or [],
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+            )
 
-        if workspace_repo:
-            from loopd_core.types import WorkspaceInfo
-            task.workspace = WorkspaceInfo(repo=workspace_repo, branch=workspace_branch)
+            if workspace_repo:
+                from loopd_core.types import WorkspaceInfo
+                task.workspace = WorkspaceInfo(repo=workspace_repo, branch=workspace_branch)
 
-        # Save to pending queue
-        task_file = self.paths.pending / f"{task_id}.json"
-        task.save_to_file(str(task_file))
+            # Save to pending queue while still holding the lock so that
+            # the next caller's _generate_task_id sees this file.
+            task_file = self.paths.pending / f"{task_id}.json"
+            task.save_to_file(str(task_file))
 
-        # Log event
+        # Log event — best-effort, outside the lock to keep critical section short
         self.event_logger.task_created(task_id, source_type, source_ref)
 
         return task
