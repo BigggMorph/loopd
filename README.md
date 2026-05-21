@@ -77,6 +77,10 @@ To pick up where a previous window left off:
 
 Storage lives under `~/.loopd/`.
 
+### Multi-window safety
+
+Opening multiple Claude Code windows and running `/dev-task` in each at the same time is supported. Each task is allocated a unique `task_id` under a single-writer lock, a separate worktree at `~/.loopd/workspaces/<task_id>--<owner>__<repo>`, and a separate branch `loopd/<task_id>`. If a worktree or branch with the same ID already exists, loopd refuses to overwrite it rather than silently destroying in-flight work.
+
 ## Updating
 
 End users:
