@@ -121,7 +121,7 @@ def main() -> None:
                 except OSError:
                     pass
                 return _exit_noop()
-            state["dev_done_injected"] = True
+            orchestrator_state.mark_dev_done_injected(state)
             orchestrator_state.write_in_lock(state)
             # Also touch sentinel — defensive.
             try:

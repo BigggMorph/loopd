@@ -15,6 +15,8 @@ import shlex
 import subprocess
 from typing import Any, Dict, List, Optional
 
+import orchestrator_state
+
 # Statuses that mean "stop processing this issue."
 _DEAD_STATUSES = {
     "done",
@@ -205,7 +207,7 @@ def resume_waiting_on_dep(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             continue
         deps = issue.get("unresolved_dependencies") or []
         if not deps:
-            issue["status"] = "ready_for_dev"
+            orchestrator_state.transition(issue, "ready_for_dev")
             return issue
         all_closed = True
         for dep in deps:
@@ -225,8 +227,8 @@ def resume_waiting_on_dep(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 all_closed = False
                 break
         if all_closed:
-            issue["status"] = "ready_for_dev"
             issue["unresolved_dependencies"] = []
+            orchestrator_state.transition(issue, "ready_for_dev")
             return issue
     return None
 

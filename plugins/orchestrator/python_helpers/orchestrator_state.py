@@ -62,6 +62,18 @@ _TERMINAL_STATUSES = {
     "reverted",
 }
 
+# Scout-cycle statuses (lives on state.scout_status, not issue.status).
+_SCOUT_STATUSES = {
+    "scout_new",
+    "scout_pending",
+    "scout_received",
+    "scout_clarify_pending",
+    "scout_confirm_pending",
+    "scout_creating",
+    "scout_done",
+    "scout_failed",
+}
+
 
 def now() -> _dt.datetime:
     return _dt.datetime.now(_dt.timezone.utc)
@@ -285,6 +297,24 @@ def transition(issue: Dict[str, Any], new_status: str) -> None:
     issue["status"] = new_status
 
 
+def scout_transition(state: Dict[str, Any], new_status: str) -> None:
+    """Record a scout-cycle status transition on state.scout_history_log.
+
+    Same-status transitions are idempotent. The scout cycle uses a
+    separate enum from issue.status, so we validate against
+    `_SCOUT_STATUSES`.
+    """
+    if new_status not in _SCOUT_STATUSES:
+        raise ValueError(f"unknown scout status: {new_status}")
+    old = state.get("scout_status")
+    if old == new_status:
+        return
+    state.setdefault("scout_history_log", []).append(
+        {"at": _iso(now()), "from": old, "to": new_status}
+    )
+    state["scout_status"] = new_status
+
+
 def mark_dev_started(state: Dict[str, Any], session_id: str) -> None:
     state["dev_session_id"] = session_id
     state["dev_done_injected"] = False
@@ -334,6 +364,7 @@ __all__ = [
     "flock_session",
     "write_in_lock",
     "transition",
+    "scout_transition",
     "mark_dev_started",
     "mark_dev_done_injected",
     "update_issue",

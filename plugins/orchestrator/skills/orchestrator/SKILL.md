@@ -461,12 +461,67 @@ After the helper:
 `<!-- split-epic-marker -->` sentinel). Transition `done`,
 current_issue=None, write, goto Step 5.
 
-#### `("waiting_on_dep", _)` / `("merged_observing", _)` / etc.
+#### `("waiting_on_dep", _)`
 
-These are handled by Step −5 and Step 5's `resume_waiting_on_dep`. For
-`merged_observing` you may also check CI status (`gh pr checks`) here and
-transition to `regression_detected` if anything looks off — see
-`docs/orchestrator-design.md §9 case ("merged_observing", _)`.
+This issue is dormant — Step 5's `picker.resume_waiting_on_dep(state)`
+re-tests dependencies on every wake. Don't process it inline here; just
+`current_issue = None`, `write()`, goto Step 5.
+
+#### `("merged_observing", _)` (Rev 13 A2)
+
+Active monitoring of a merged PR for 6h. On every wake:
+
+1. Find the matching `state.watch_list` entry by `pr_url`. If missing,
+   transition `done_final` and continue.
+2. Run regression probes:
+   - **CI**: `gh pr checks {pr_url} --json conclusion --jq '.[].conclusion'`.
+     Any `"failure"` → `ci_red = True`.
+   - **External revert**: `gh pr list --repo {repo} --search 'in:title
+     "Revert" head:{issue.pr_branch}' --json number --jq 'length'`.
+     `> 0` → `reverted_externally = True`.
+   - **Cross-reference**: `gh issue list --repo {repo} --state open
+     --label bug --search 'created:>{watch.merged_at}' --json
+     title,body --jq '.[] | select(.body | contains("<first touched path>"))' | head -3`.
+     Any output → `regression_suspect = True`.
+3. If any probe is true: save evidence on `issue.regression_evidence`,
+   transition `regression_detected`, continue.
+4. Else if `now() >= watch.expires_at`: drop watch_list entry,
+   transition `done_final`, `current_issue=None`, `write()`, goto Step 5.
+5. Else: return (wait for next wake).
+
+#### `("regression_detected", _)` (Rev 13 A2)
+
+- If `wake_reason == ("user_input", None)` — apply the AskUser answer:
+  - **`revert`**: `audited_bash gh pr create --repo {repo} --title 'Revert: {issue.title}' --body 'Auto-revert by orchestrator: regression suspected on PR {pr_url}\n\nEvidence: {regression_evidence}' --head 'revert-{pr_branch}' --base main`. The actual `git revert <sha>` step needs a worktree — emit a guide to the user; transition `reverted`.
+  - **`keep`**: transition `done_final`.
+  - **`manual`**: transition `needs_human` with failure_reason "regression suspected — user chose manual review".
+  - Drop the watch_list entry; `current_issue=None`; `write()`; goto Step 5.
+- Else (first entry):
+  - If `regression_q_emitted` is already true, return (still waiting for answer).
+  - Else AskUserQuestion with three options
+    (revert/keep/manual) and a summary of `regression_evidence`.
+  - Set `regression_q_emitted=True`, return.
+
+#### `("pr_audit_pending", _)` (Rev 13 B3)
+
+A `Step −4` push routed this issue here. The user answer (close /
+rebase / keep) arrives via the `pending_questions` flush in Step −3 and
+sets a flag on the issue. On wake:
+
+- If `issue.audit_decision == "close"`: `audited_bash gh pr close <num>
+  --repo {repo}` + add label `orchestrator-abandoned`; transition
+  `skipped_by_human`.
+- If `"rebase"`: emit guidance (the lead can't rebase remotely);
+  transition `parked_awaiting_human`.
+- If `"keep"`: just transition back to the issue's prior status (use
+  `history`); reset `last_pr_audit_at` for this PR so it doesn't
+  re-trigger immediately.
+- Else: return (decision not in yet).
+
+#### `("done_final", _)` / `("reverted", _)`
+
+Both are terminal; ensure `state.current_issue = None`, write, goto
+Step 5.
 
 #### `("done"|"needs_human"|"skipped_by_human"|"parked_awaiting_human", _)`
 Terminal. `current_issue=None`, `completed_count += 1` (for `done` only),
