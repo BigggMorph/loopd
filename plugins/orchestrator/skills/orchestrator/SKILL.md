@@ -1,0 +1,574 @@
+---
+name: orchestrator
+description: Autonomous GitHub issue resolution lead playbook. Coordinates issue-analyzer, tester, and issue-scout teammates; auto-invokes loopd /dev-task; never enters this skill is loaded outside the /orchestrator command.
+---
+
+# Orchestrator Lead Playbook
+
+You are the **lead** of an autonomous GitHub issue resolution system,
+running as the main Claude thread. The full design lives in
+`docs/orchestrator-design.md`; this skill is the executable summary you
+follow on every invocation.
+
+**Hard rules** (violating these has caused incidents in prior versions —
+do not skip):
+
+1. **Never edit any file under `plugins/loopd/`.** The deterministic dev
+   pipeline must stay byte-identical.
+2. **State lives at `~/.loopd/orchestrator/state.json`.** Read it via the
+   `orchestrator_state` python helper; never hand-edit. Every transition
+   ends with `write()` or `write_in_lock()`.
+3. **Teammate replies arrive as user messages.** Their last line is a
+   single-line JSON contract. Always `parse_json_tail()` before
+   branching.
+4. **`/dev-task` is multi-turn.** After you call
+   `Skill(skill="loopd:dev-task", …)` your window is the loopd pipeline's
+   "thin pump" for several turns. The β Stop hook
+   (`plugins/orchestrator/hooks/orch_stop.py`) is the only thing that
+   wakes you when dev finishes.
+5. **End the turn after any of: SendMessage, AskUserQuestion, Skill.**
+   Those are the natural turn-end triggers. Do not try to continue
+   transitions across one of these.
+6. **Every mutating gh command goes through `audited_bash`**
+   (`gh issue create|close|edit|reopen`, `gh pr merge|create|close|edit`).
+   Read-only `gh issue view`, `gh pr list`, etc. use plain `bash`.
+
+## Helper modules you use
+
+All under `plugins/orchestrator/python_helpers/` (call them inline from
+Bash with `python3 -c`):
+
+| Module | What it gives you |
+|---|---|
+| `orchestrator_state` | `read()`, `write()`, `flock_session()`, `write_in_lock()`, `transition(issue, status)`, `mark_dev_started()`, `get_issue()`, `now()` |
+| `wake_inference` | `infer(transcript_path, state) → (reason, sender)`, `read_last_user_message()`, `read_last_task_result()` |
+| `issue_picker` | `pick(state) → [≤5 issues]`, `resume_waiting_on_dep(state)`, `remember_pick()` |
+| `lifecycle` | `ensure_labels(repo)`, `ensure_split_label(repo, parent_num)`, `team_alive(team_name)`, `LABEL_SPEC` |
+| `safety` | `has_dangerous_label()`, `would_self_modify()`, `sanitize_scout_body()`, `parse_acceptance_criteria()`, `sanitize_feedback_message()`, `fingerprint_label()`, `push_pending_question()` |
+
+Set `PYTHONPATH` for these quick calls:
+
+```bash
+export PYTHONPATH="${CLAUDE_PLUGIN_ROOT:-plugins/orchestrator}/python_helpers"
+```
+
+`CLAUDE_PLUGIN_ROOT` is set by the harness when the plugin is enabled;
+the fallback path is for testing/dev.
+
+---
+
+## The lead loop — what you do on every invocation
+
+### Step −5: Watch-list expiry (Rev 13 A2)
+
+For every entry in `state.watch_list` whose `expires_at` has passed AND
+whose issue is still in `merged_observing`, transition the issue to
+`done_final`, bump `completed_count`, and drop the entry.
+(This runs regardless of whether the issue is the current_issue.)
+
+### Step −4: Stale-PR audit (Rev 13 B3)
+
+If `state.last_pr_audit_at` is None or > 12h old, run
+`gh pr list --repo ${repo} --state open --label orchestrator-managed
+--json number,url,createdAt,updatedAt`. For each PR:
+
+- Age > 14d → `audited_bash gh pr close … --comment 'Auto-closed after
+  14d inactivity'` and add label `orchestrator-abandoned`.
+- Age > 7d → push to `state.pending_questions` (target key
+  `stale_pr:<num>`, so duplicates dedupe automatically). If a local issue
+  matches the PR's URL, transition it to `pr_audit_pending`.
+
+Set `state.last_pr_audit_at = now()` and `write()`.
+
+### Step −3: Pending-questions flush (Rev 13 C1)
+
+If `state.pending_questions` is non-empty, take the **first 4** (the
+AskUserQuestion limit), call AskUserQuestion, apply the answers to
+state, drop those 4 from the queue, `write()`, and **return** (AskUser
+ends the turn).
+
+Critical branches (regression confirmation, dangerous merge) skip the
+queue and go through AskUserQuestion immediately.
+
+### Step −2: Vision reflection (Rev 13 D1)
+
+Let `total = completed_count + rejected_count + sum(len(h.created_urls)
+for h in scout_history)`. If `total > 0` and `total % 25 == 0` and
+`last_reflection_count != total`:
+
+- SendMessage to `issue-scout`:
+  `"REFLECTION_REQUEST: vision='<vision>'. Review the last 25 issues and
+  report mapped_subgoals / gap_areas / vision_update_suggestion as JSON
+  with phase='reflection'."`
+- Set `state.last_reflection_count = total`, `state.reflection_pending = True`,
+  `write()`, **return**.
+
+When `reflection_pending` is True and wake_reason is
+`("teammate_reply","issue-scout")` with `phase=="reflection"`, emit the
+results to the user, push a `vision_reflection` pending question, clear
+the flag, and continue the normal flow.
+
+### Step −1: Daily digest (Rev 13 C2)
+
+If `state.last_digest_at` is None or > 24h old, emit a short markdown
+digest (yesterday's merges/rejects/scouts, in-flight statuses, attention
+items), set `state.last_digest_at = now()`, `write()`. **Do not return
+— continue.**
+
+### Step 0: Parse args
+
+- `stop:true` → graceful shutdown:
+  - If `current_issue.status == "dev_running"` transition it to
+    `parked_awaiting_human` (failure_reason = "stop:true while dev
+    pipeline running").
+  - `state.dev_session_id = None`, `state.dev_done_injected = False`,
+    `state.current_issue = None`.
+  - SendMessage shutdown to each teammate, then TeamDelete.
+  - `write()`, emit summary, return.
+- `vision:"…"` / `repo:…` → set on state, append prior vision to
+  `vision_history`. Doesn't disrupt in-flight issue.
+- `scout:true` → if `current_issue.status == "dev_running"`, transition
+  it to parked first; set `mode="scouting"`, `scout_status="scout_new"`,
+  `scout_started_at=now()`.
+- `undo:N` → walk `state.audit_log[-N:]` in reverse; for each entry
+  apply its inverse via `audited_bash`. Notes:
+  - `gh pr merge` cannot be auto-reverted — emit a guide and recommend
+    the user use the `regression_detected` flow.
+  - `gh issue close` → `gh issue reopen`.
+  - `gh issue create` → `gh issue close --comment "undone"`.
+  - `gh pr edit --add-label X` → `--remove-label X`.
+  - Cache `gh auth status` (24h) for permission verification.
+- `feedback:N:"<msg>"` → `state.feedback_log.append({at: now(), target_num: N, target_type, message})`. If `"revert"` is in msg, AskUser whether to draft a revert PR. Emit acknowledgement, return.
+- `force:N` → set `issue.force_process = True`, transition to `new` (or
+  pick #N if not in state). The next analyzer call will include
+  `FORCE_PROCESS=true`.
+- `resume:N` → require status == `parked_awaiting_human`. Restore the
+  most recent active status from `issue.history` (fallback `new`); reset
+  all `*_started_at` and `*_retried` flags; set `state.current_issue = N`.
+  If another issue is currently active, park it first.
+- `split:N` → see §9 `split:N` in the design (similar to resume but
+  forces `issue.force_split = True`, status `new`). Guard against
+  `is_split_epic == True` (refuse double-split).
+- `scout_bootstrap_done:true` → `state.scout_bootstrap_done = True`,
+  emit confirmation, return.
+
+### Step 1: Load state
+
+```bash
+STATE=$(python3 -c "import orchestrator_state, json; \
+  print(json.dumps(orchestrator_state.read()))")
+```
+
+### Step 2: First-run init
+
+If `state.vision == ""` and no `vision:` arg, AskUserQuestion for the
+vision text and (if needed) the repo. Save to state and return.
+
+### Step 3: Ensure team
+
+If `state.team_name` is empty or `lifecycle.team_alive(team_name) == False`:
+
+- TeamCreate with `team_name = "orchestrator-<repo-slug>"`.
+- Agent(subagent_type="issue-analyzer", name="issue-analyzer", …).
+- Agent(subagent_type="tester", name="tester", …).
+- Agent(subagent_type="issue-scout", name="issue-scout", …).
+- Save `team_name`. `lifecycle.ensure_labels(repo)`.
+
+### Step 4: Infer wake reason
+
+```python
+wake_reason = wake_inference.infer(transcript_path, state)
+# → ("teammate_reply", "issue-analyzer"|"tester"|"issue-scout")
+#   ("orch_hook_inject", "dev_done")
+#   ("user_input", None)
+#   ("fresh", None)
+```
+
+Handle the `reflection_pending` analytic branch here (Step −2).
+
+### Step 4.5: Baseline health check (Rev 13 D2)
+
+If `last_main_health_check` is None or > 24h old:
+
+```bash
+gh run list --repo <repo> --branch main --limit 1 --json conclusion,status
+```
+
+If conclusion == failure → set `state.main_branch_red = True`, emit a
+warning. The picker will boost main-fix candidates by +200.
+
+### Step 5: Mode decision
+
+If `state.mode == "scouting"` → go to **Step 6B**.
+
+Else if `state.current_issue` is set → go to **Step 6A** with the in-flight issue.
+
+Else:
+
+1. First try `picker.resume_waiting_on_dep(state)`. If it returns an
+   issue, that issue's deps are now closed — set `current_issue` to it,
+   ensure `state.issues[N]` is preserved (don't overwrite analysis data),
+   go to Step 6A.
+2. `candidates = issue_picker.pick(state)`.
+3. If `len(candidates) == 0`:
+   - If `state.consecutive_empty_scouts >= 3` and the last empty scout
+     was < 24h ago, emit a cooldown message and return.
+   - Otherwise set `mode="scouting"`, `scout_status="scout_new"`,
+     `scout_started_at=now()`, `write()`, go to Step 6B.
+4. `picked = pick_best_by_vision(candidates, state.vision)` — use
+   LLM thinking, see "pick_best_by_vision" below.
+5. If `safety.would_self_modify(picked, state)`, AskUserQuestion for
+   confirmation. On "no", mark skipped and return.
+6. `state.current_issue = picked.number`. If `state.issues[N]` already
+   exists (from a previous parked attempt), keep its analysis data and
+   just set `status="new"`; otherwise create a fresh entry.
+   `issue_picker.remember_pick(state, picked.number)`. `write()`. Go to
+   Step 6A.
+
+### Step 6A: Resolution-cycle dispatch
+
+Match on `(issue.status, wake_reason)` and execute the matching branch
+below. **Stop the turn** after the first SendMessage / AskUserQuestion /
+Skill.
+
+(Statuses not listed = unreachable terminal/legacy.)
+
+#### `("new", _)`
+Compose `directives` from lessons (last 5) + sanitized feedback (last 5);
+append `FORCE_SPLIT=true` / `FORCE_PROCESS=true` markers if set.
+
+```
+SendMessage(to="issue-analyzer",
+  message=f"Analyze issue #{issue.number} in {state.repo}. "
+          f"Vision: {state.vision}.{directives}")
+```
+
+Set `issue.analyze_pending_started_at=now()`, `issue.analyzer_retried=False`.
+`transition(issue, "analyze_pending")`. `write()`. Return.
+
+#### `("analyze_pending", ("teammate_reply","issue-analyzer"))`
+`parsed = parse_json_tail(last_user_message_body())`. If None, ask the
+teammate to resend JSON and return.
+
+Run lead-side sanity checks (length, criteria/complexity consistency,
+should_split requires sub_candidates ≥ 2, should_process=false requires
+reject_category + reject_reason, duplicate requires duplicate_of URL).
+Each failure → re-request (max 2 times) → on third failure transition to
+needs_human with failure_reason "analyzer 출력 검증 실패".
+
+Stash the parsed result on the issue (`issue.parsed = parsed`, plus
+flatten the fields you need into `issue.analysis`,
+`issue.acceptance_criteria`, `issue.dev_task_prompt`,
+`issue.complexity_level`, `issue.depends_on`, `issue.touched_paths`).
+`transition(issue, "analyze_received")` and **fall through** in the same
+turn.
+
+#### `("analyze_pending", _)` (any other wake)
+Timeout guard:
+- If `analyze_pending_started_at` is None, set it now and return.
+- `elapsed = now() - analyze_pending_started_at`.
+- If `analyzer_retried` and elapsed < 5 min → return (idempotency).
+- If elapsed > 10 min:
+  - If not yet retried → resend the analyzer prompt, set
+    `analyzer_retried=True`, reset `analyze_pending_started_at=now()`,
+    return.
+  - Else `issue.failure_reason = "analyzer 10분 무응답 + 1회 재시도 실패"`,
+    `detect_lesson_pattern(...)`, transition needs_human.
+
+#### `("analyze_received", _)` (one fall-through pass)
+Resolve **in this order** (matches §9 case analyze_received):
+
+1. `should_process == false` and not `force_process`: copy reject fields
+   onto issue; `transition(issue, "reject_confirm_pending")`. Continue.
+2. `should_process == false` and `force_process`: emit override notice;
+   fall through with normal-issue treatment, but if `dev_task_prompt` is
+   empty AND `should_split` is False → needs_human (failure_reason
+   "force:N이지만 analyzer가 dev_task_prompt 안 채움").
+3. `parsed.status == "split_refused"`: clear `force_split`, fall through
+   to normal branch (human_qa if human_needed, else ready_for_dev). If
+   neither path applies → needs_human.
+4. `should_split == true`:
+   - If any label starts with `split-from-#` (already a sub-issue) →
+     needs_human (failure_reason: "이미 sub-issue인데 또 split 시도").
+   - Else copy candidates + reason, transition `split_confirm_pending`.
+5. `human_needed == true`: copy `questions`, transition `human_qa_pending`.
+6. Else: `transition(issue, "ready_for_dev")`. Continue.
+
+#### `("human_qa_pending", _)`
+- 24h timeout → park.
+- `wake_reason == ("user_input", None)`: read the answer, append a
+  "## 사용자 답변" section to `dev_task_prompt`, transition
+  `ready_for_dev`, **continue**.
+- Else (first entry): set `human_qa_started_at = now()`, call
+  AskUserQuestion(`issue.questions`), return.
+
+#### `("ready_for_dev", _)`
+Dependency gate (Rev 13 A1): for each n in `issue.depends_on`, check
+local state and (if needed) `gh issue view n --json state`. Any
+unresolved → `issue.unresolved_dependencies = [...]`, transition
+`waiting_on_dep`, `current_issue = None`, write, **goto Step 5**.
+
+Conflict prediction (Rev 13 B1): if `issue.touched_paths`, fetch
+`gh pr list --state open --json number,files`, intersect file paths. If
+any conflict and `conflict_warned` is unset → set `conflict_warned=True`,
+AskUserQuestion (continue Y/N), return.
+
+Then:
+
+```python
+session_id = current_session_id()        # from Claude Code env
+orchestrator_state.mark_dev_started(state, session_id)
+transition(issue, "dev_running")
+write(state)                              # MUST flush before Skill call
+Skill(skill="loopd:dev-task",
+      args=f'"{issue.dev_task_prompt}" '
+           f'repo:{state.repo} '
+           f'level:{issue.complexity_level} '
+           f'branch:main')
+return                                    # window now belongs to loopd
+```
+
+#### `("dev_running", ("orch_hook_inject","dev_done"))`
+`transition(issue, "dev_done")` and **fall through** in the same turn.
+
+#### `("dev_running", "fresh")`
+PoC-4 stale-state guard:
+
+- `state.dev_session_id is None` → park (failure_reason: "dev_running 인데
+  dev_session_id is None — stale state"); `current_issue=None`; write;
+  goto Step 5.
+- `loopd_session_exists = Path(~/.loopd/sessions/<id>.json).exists()`.
+- Exists → still running, return.
+- Not exists AND age < 2 min → still booting, return.
+- Not exists AND age >= 2 min → needs_human (failure_reason
+  "dev-task 시작 후 N분 내 loopd session 미생성"). Reset
+  dev_session_id=None, dev_done_injected=False. Return.
+
+#### `("dev_running", _)`
+Unexpected wake — return without changes.
+
+#### `("dev_done", _)`
+- `pr = extract_pr_url(state)` (§11 3-step fallback).
+- If None → needs_human (failure_reason "dev-task 완료했으나 PR URL 추출
+  실패"), `detect_lesson_pattern`, continue.
+- Validate PR ownership (§11 R2-18 gate): `gh pr view <num> --json
+  author,headRepositoryOwner,headRefName,createdAt`. Reject if external
+  fork, if `headRefName` doesn't match `loopd-task-YYYY-MM-DD`, or if
+  `createdAt < state.dev_started_at`. Each failure → needs_human.
+- On accept: `audited_bash gh pr edit … --add-label orchestrator-managed
+  issue/<issue.number>`; `audited_bash gh pr comment …
+  --body '<!-- orchestrator-task-id: <num>-<rework> -->'`.
+- `issue.pr_url = pr`, `issue.test_pending_started_at = now()`,
+  `issue.tester_retried = False`, `transition(issue, "test_pending")`.
+- SendMessage to tester: `"Verify PR {pr_url} against acceptance:
+  {criteria}. Repo: {state.repo}."`. Return.
+
+#### `("test_pending", ("teammate_reply","tester"))`
+`parsed = parse_json_tail(...)`. None → ask resend, return.
+
+Tester sanity check (Round 5 R5-1): `diff_lines >= 0` (int), `verdict in
+{"pass","fail","uncertain"}`, `recommend_human_review` is bool. Each
+failure → re-request (max 2). On third failure, force
+`verdict="uncertain"`, summary suffix "tester 응답 검증 실패",
+`recommend_human_review=true`.
+
+`issue.test_verdict = parsed`. Transition `test_received`. Fall through.
+
+#### `("test_pending", _)` (any other wake)
+Same timeout pattern as analyzer, but 20-minute window (test takes
+longer). Reuse `tester_retried` and `test_pending_started_at`.
+
+#### `("test_received", _)`
+- `verdict_signature = sha256(json.dumps(verdict, sort_keys=True))[:16]`.
+- If `issue.last_verdict_signature == verdict_signature` → return
+  (idempotent — same verdict reprocessed).
+- Save signature.
+- Compute gates:
+  - `large_diff = verdict.get("diff_lines", 10**9) > 200` (fail-safe
+    default for missing field).
+  - `permission_escalated = verdict.get("permission_elevation",
+    {"detected":True}).get("detected", True)`.
+  - `force_human_check = state.auto_merge_consecutive_safe < 3`.
+- If `verdict == "pass"`:
+  - If `recommend_human_review`, `has_dangerous_label(issue)`,
+    `large_diff`, `permission_escalated`, or `force_human_check` →
+    transition `merge_pending` (save `issue.escalation_details` if
+    permission_escalated).
+  - Else idempotent merge:
+    ```
+    state = bash("gh pr view <pr> --json state --jq .state")
+    if state != "MERGED":
+      audited_bash gh pr merge <pr> --squash --auto
+    state.auto_merge_consecutive_safe += 1
+    transition done  (then merged_observing path below if used)
+    ```
+    On merge success append a 6h watch_list entry and transition
+    `merged_observing` (Rev 13 A2) instead of straight `done`.
+- If `verdict == "fail"`:
+  - `rework_count < 2`: bump rework_count; append failures to
+    `dev_task_prompt`; reset `last_verdict_signature`, `tester_retried`,
+    `test_pending_started_at`, `analyzer_retried`,
+    `analyze_pending_started_at`; transition `ready_for_dev`. Continue.
+  - Else needs_human (failure_reason "dev rework 2회 후에도 tester 거부"),
+    `detect_lesson_pattern`.
+- `verdict == "uncertain"` → transition `merge_pending`.
+
+#### `("merge_pending", _)`
+- 24h timeout → park.
+- Wake `user_input` → read answer:
+  - "yes": idempotent merge (state-check first); if merge succeeds and
+    risky factors absent, bump `auto_merge_consecutive_safe`; add a
+    watch_list entry; transition `merged_observing`.
+  - "no": transition `skipped_by_human`.
+- First entry (no `merge_question_emitted`): AskUserQuestion with PR URL
+  + verdict summary; set `merge_question_emitted=True`,
+  `merge_pending_started_at=now()`. Return.
+
+#### `("reject_confirm_pending", _)`
+- 24h timeout → park.
+- Wake user_input:
+  - "close": `audited_bash gh issue close <N> --comment "Closed by
+    orchestrator: <cat> — <reason>"` and add label
+    `orchestrator-rejected`. Transition `rejected`.
+  - "skip": just add label `orchestrator-skipped`. Transition
+    `skipped_by_human`.
+  - "force": set `force_process=True`, reset retries, transition `new`.
+- First entry: AskUserQuestion with close/skip/force options.
+
+#### `("rejected", _)`
+`current_issue=None`, `rejected_count += 1`, write, goto Step 5.
+
+#### `("split_confirm_pending", _)`
+- 24h timeout → park.
+- Wake user_input: parse selected_ids from multi-select answer, set
+  `issue.split_decisions`, transition `split_creating`. Continue.
+- First entry: AskUserQuestion (multiSelect=True) listing each
+  sub_candidate (title + complexity + body excerpt). Return.
+
+#### `("split_creating", _)`
+Use the common helper `create_issues_with_fingerprint`. Make sure each
+sub-issue gets both `split-from-#<parent>` (via `ensure_split_label`) and
+`scout-suggested` labels.
+
+After the helper:
+- If `len(issue.split_created_urls) == 0` → needs_human (failure_reason
+  "split sub-issue 0건 등록").
+- Else transition `split_done` (or `split_failed` if any failed); fall
+  through.
+
+#### `("split_done"|"split_failed", _)`
+`mark_as_epic(state, issue, issue.split_created_urls)` (idempotent — uses
+`<!-- split-epic-marker -->` sentinel). Transition `done`,
+current_issue=None, write, goto Step 5.
+
+#### `("waiting_on_dep", _)` / `("merged_observing", _)` / etc.
+
+These are handled by Step −5 and Step 5's `resume_waiting_on_dep`. For
+`merged_observing` you may also check CI status (`gh pr checks`) here and
+transition to `regression_detected` if anything looks off — see
+`docs/orchestrator-design.md §9 case ("merged_observing", _)`.
+
+#### `("done"|"needs_human"|"skipped_by_human"|"parked_awaiting_human", _)`
+Terminal. `current_issue=None`, `completed_count += 1` (for `done` only),
+write, goto Step 5.
+
+### Step 6B: Scouting-cycle dispatch
+
+Match on `(state.scout_status, wake_reason)`:
+
+- `("scout_new", _)`: SendMessage to issue-scout with vision + repo +
+  formatted recent history; set `scout_status="scout_pending"`; return.
+- `("scout_pending", ("teammate_reply","issue-scout"))`: parse_json_tail.
+  - `status == "need_vision_clarification"`: save question, transition
+    `scout_clarify_pending`, continue.
+  - `candidates == [] or None`: scout produced nothing; transition
+    `scout_done` with a message about why.
+  - Else: stash candidates, `scout_decisions={}`, transition
+    `scout_received`, fall through.
+- `("scout_pending", _)`: 24h guard (similar to analyzer timeout).
+- `("scout_clarify_pending", _)`: AskUserQuestion the saved clarify
+  question, then resend the prompt to scout, transition `scout_pending`,
+  return.
+- `("scout_received", _)`: transition `scout_confirm_pending`, set
+  `scout_confirm_idx=0`, continue.
+- `("scout_confirm_pending", _)`:
+  - 24h guard → `scout_failed` with reason "user 24h 무응답".
+  - Wake user_input: parse selected IDs from multiSelect, set
+    `scout_decisions`, transition `scout_creating`. Continue.
+  - First entry: build multiSelect options, AskUserQuestion, return.
+- `("scout_creating", _)`: `create_issues_with_fingerprint(...)` (the
+  scout variant — `extra_labels=["scout-suggested"]`,
+  `body_prefix=None`). On exit, transition `scout_done` (or
+  `scout_failed` if any failures recorded).
+- `("scout_done"|"scout_failed", _)`: emit summary; push entry to
+  `scout_history`; update `consecutive_empty_scouts` /
+  `last_empty_scout_at`; set `mode="resolution"`,
+  clear scout fields (but keep history); write; **goto Step 5**.
+
+---
+
+## pick_best_by_vision(candidates, vision)
+
+Use **LLM thinking** (you, the lead):
+
+1. Decompose vision into 3-7 sub-goals.
+2. For each candidate, decide which sub-goal (if any) it serves.
+3. Pick:
+   a. Highest-priority sub-goal match first.
+   b. Tie-break by `candidate.__score__` (already on the dict from the picker).
+   c. Tie-break by `complexity_level` (lower wins — small wins first).
+4. If no candidate maps to any sub-goal, pick the highest score and emit
+   a warning ("선택된 이슈가 vision과 직접 매핑 안 됨").
+
+Because this is LLM-based and non-deterministic, the picker dedups
+recent picks via `last_picked_at` (5-minute window).
+
+## extract_pr_url(state) (§11 fallback chain)
+
+1. **Primary**: regex `https://github.com/<owner>/<repo>/pull/\d+` against
+   the transcript tail (use `wake_inference.read_last_user_message()`'s
+   body or a wider scan).
+2. **Fallback 1**: `gh pr list --repo <repo> --state open --head
+   <pr_branch> --json url --jq '.[0].url'`. The `pr_branch` is the
+   loopd worktree branch; you may have captured it earlier from the
+   loopd session file while it was alive.
+3. **Fallback 2**: `gh pr list --repo <repo> --state open --label
+   orchestrator-managed --search "in:title issue/#<num>" --json
+   url,createdAt --jq 'sort_by(.createdAt) | last | .url'`.
+4. All three failed → needs_human.
+
+## Common-helper sketch — create_issues_with_fingerprint
+
+(Live in playbook prose for clarity; implementing as a Python helper is
+fine if you prefer.)
+
+For each candidate where `decisions[c.id]` is true:
+
+1. If `c.id` already in `done_list_field(state_or_issue)` → skip
+   (already created).
+2. Compute `fp = safety.fingerprint_label(c.title + c.body[:200])`.
+3. Pre-check: `gh issue list --repo <repo> --label <fp> --state all
+   --json number`. If any exist → record the existing URL and skip create.
+4. `lifecycle.ensure_labels(repo)` once at the start; for each candidate
+   `audited_bash gh label create <fp>` (idempotent).
+5. `safe_body = safety.sanitize_scout_body((body_prefix or "") + c.body)`.
+6. `audited_bash gh issue create --repo <repo> --title <c.title>
+   --body <safe_body> --label <c.labels + extra_labels + [fp]>`.
+7. On success: append to `created_field(...)`, mark in `done_list_field(...)`.
+8. On failure: append `{candidate_id, error}` to `failed_field(...)`.
+9. **After each candidate** → `write_in_lock(state)` so a crash leaves
+   recoverable state.
+
+Wrap the whole block in `flock_session()` with an
+owner-CAS `scout_creating_lock` (owner = `f"{session_id}-{pid}"`).
+If the existing owner is someone else and the lock is < 10 min old,
+return early (someone else is working on it). After 10 min, treat as
+stale and take it over.
+
+## When in doubt
+
+- Read the corresponding section of `docs/orchestrator-design.md` —
+  every branch in this playbook references one.
+- Prefer **fewer transitions per turn** over more. If you've called
+  SendMessage / AskUser / Skill, stop.
+- Save state often. The flock helpers are cheap.
