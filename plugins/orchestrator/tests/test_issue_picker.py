@@ -58,14 +58,15 @@ SAMPLE_ISSUES = [
     },
     {
         "number": 5,
-        "title": "Split epic",
+        "title": "Split epic (already split)",
         "labels": [{"name": "split-epic"}, {"name": "priority/high"}],
         "reactions": {"totalCount": 0},
         "createdAt": "2025-06-01T00:00:00Z",
         "updatedAt": "2025-06-01T00:00:00Z",
         "assignees": [],
         "author": {"login": "bot"},
-        "body": "...",
+        # Rev 17 — marker is now the authoritative skip signal.
+        "body": "...\n<!-- split-epic-marker -->\nchildren",
     },
     {
         "number": 6,
@@ -163,3 +164,136 @@ def test_remember_pick_records_timestamp():
     state = {"last_picked_at": {}}
     issue_picker.remember_pick(state, 7)
     assert "7" in state["last_picked_at"]
+
+
+# =====================================================================
+# Rev 17 Phase 17-E — FORCE_SPLIT / Epic skip
+# =====================================================================
+
+def test_split_epic_marker_in_body_excludes(monkeypatch):
+    issue = {
+        "number": 99,
+        "title": "Parent Epic (already split)",
+        "labels": [],
+        "body": "Some body\n\n<!-- split-epic-marker -->\n\nchildren...",
+        "createdAt": "2026-05-22T10:00:00Z",
+    }
+    assert issue_picker._is_excluded(issue) is True
+
+
+def test_split_epic_label_alone_does_not_exclude_anymore(monkeypatch):
+    """Rev 17: split-epic label without marker stays pickable (Stage 1 newly registered)."""
+    issue = {
+        "number": 99,
+        "title": "Planner Epic (unsplit)",
+        "labels": [{"name": "planner-suggested"}, {"name": "split-epic"}],
+        "body": "## User Story\n...",
+        "createdAt": "2026-05-22T10:00:00Z",
+    }
+    assert issue_picker._is_excluded(issue) is False
+
+
+def test_orchestrator_rejected_label_still_excludes():
+    issue = {
+        "number": 5,
+        "title": "x",
+        "labels": [{"name": "orchestrator-rejected"}],
+        "body": "",
+        "createdAt": "2026-05-22T10:00:00Z",
+    }
+    assert issue_picker._is_excluded(issue) is True
+
+
+def test_is_orchestrator_authored_finds_audit_entry():
+    state = {
+        "audit_log": [
+            {"action": "gh issue create", "target": "42", "argv": ["gh", "issue", "create", "..."]}
+        ]
+    }
+    issue = {"number": 42, "labels": []}
+    assert issue_picker.is_orchestrator_authored(issue, state) is True
+
+
+def test_is_orchestrator_authored_matches_url_target():
+    state = {
+        "audit_log": [
+            {
+                "action": "gh issue create",
+                "target": "https://github.com/x/y/issues/77",
+                "argv": [],
+            }
+        ]
+    }
+    issue = {"number": 77, "labels": []}
+    assert issue_picker.is_orchestrator_authored(issue, state) is True
+
+
+def test_is_orchestrator_authored_false_when_no_entry():
+    state = {"audit_log": []}
+    issue = {"number": 11, "labels": []}
+    assert issue_picker.is_orchestrator_authored(issue, state) is False
+
+
+def test_is_orchestrator_authored_ignores_non_create_actions():
+    state = {
+        "audit_log": [
+            {"action": "gh issue close", "target": "42", "argv": []}
+        ]
+    }
+    issue = {"number": 42, "labels": []}
+    assert issue_picker.is_orchestrator_authored(issue, state) is False
+
+
+def test_needs_force_split_true_for_orchestrator_planner_epic():
+    state = {
+        "audit_log": [
+            {"action": "gh issue create", "target": "42", "argv": []}
+        ]
+    }
+    issue = {
+        "number": 42,
+        "labels": [
+            {"name": "planner-suggested"},
+            {"name": "split-epic"},
+            {"name": "enhancement"},
+        ],
+        "body": "## User Story\n...",
+    }
+    assert issue_picker.needs_force_split(issue, state) is True
+
+
+def test_needs_force_split_false_when_external_labels():
+    """Round A S3 — external user can't coerce FORCE_SPLIT by adding labels."""
+    state = {"audit_log": []}  # no orchestrator-create entry
+    issue = {
+        "number": 99,
+        "labels": [{"name": "planner-suggested"}, {"name": "split-epic"}],
+        "body": "## User Story\n...",
+    }
+    assert issue_picker.needs_force_split(issue, state) is False
+
+
+def test_needs_force_split_false_when_already_split():
+    state = {
+        "audit_log": [{"action": "gh issue create", "target": "42", "argv": []}]
+    }
+    issue = {
+        "number": 42,
+        "labels": [{"name": "planner-suggested"}, {"name": "split-epic"}],
+        "body": "## User Story\n\n<!-- split-epic-marker -->\nchildren\n",
+    }
+    assert issue_picker.needs_force_split(issue, state) is False
+
+
+def test_needs_force_split_requires_both_labels():
+    state = {
+        "audit_log": [{"action": "gh issue create", "target": "42", "argv": []}]
+    }
+    issue = {
+        "number": 42,
+        "labels": [{"name": "planner-suggested"}],  # missing split-epic
+        "body": "...",
+    }
+    assert issue_picker.needs_force_split(issue, state) is False
+    issue["labels"] = [{"name": "split-epic"}]  # missing planner-suggested
+    assert issue_picker.needs_force_split(issue, state) is False

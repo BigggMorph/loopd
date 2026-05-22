@@ -132,3 +132,295 @@ def test_shutdown_marker_is_valid_json():
     parsed = json.loads(raw)
     assert parsed["type"] == "shutdown_request"
     assert parsed["team"] == "orch-x-y"
+
+
+def test_optional_teammates_are_three():
+    assert set(lifecycle.OPTIONAL_TEAMMATES) == {
+        "product-planner",
+        "roadmap-strategist",
+        "vision-critic",
+    }
+
+
+def test_label_spec_includes_rev17_labels():
+    names = {l["name"] for l in lifecycle.LABEL_SPEC}
+    assert "planner-suggested" in names
+    assert "roadmap-context" in names
+    assert "vision-update-pending" in names
+
+
+def test_discover_alive_teammates_empty_when_no_team(tmp_path, monkeypatch):
+    monkeypatch.setattr(lifecycle, "TEAMS_DIR", tmp_path / "teams")
+    assert lifecycle.discover_alive_teammates("orch-x-y") == set()
+    assert lifecycle.discover_alive_teammates("") == set()
+
+
+def test_discover_alive_teammates_returns_member_names(tmp_path, monkeypatch):
+    monkeypatch.setattr(lifecycle, "TEAMS_DIR", tmp_path / "teams")
+    cfg_dir = tmp_path / "teams" / "orch-x-y"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "members": [
+                    {"name": "issue-analyzer"},
+                    {"name": "tester"},
+                    "issue-scout",
+                    {"name": "product-planner"},
+                ]
+            }
+        )
+    )
+    alive = lifecycle.discover_alive_teammates("orch-x-y")
+    assert alive == {
+        "issue-analyzer", "tester", "issue-scout", "product-planner"
+    }
+
+
+def test_ensure_team_member_returns_true_when_alive(tmp_path, monkeypatch):
+    monkeypatch.setattr(lifecycle, "TEAMS_DIR", tmp_path / "teams")
+    cfg_dir = tmp_path / "teams" / "orch-x-y"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "config.json").write_text(
+        json.dumps({"members": [{"name": "product-planner"}]})
+    )
+    state = {"pending_team_spawns": []}
+    assert lifecycle.ensure_team_member("orch-x-y", "product-planner", state) is True
+    assert state["pending_team_spawns"] == []
+
+
+def test_ensure_team_member_marks_pending_when_not_alive(tmp_path, monkeypatch):
+    monkeypatch.setattr(lifecycle, "TEAMS_DIR", tmp_path / "teams")
+    # Empty team config — member is not alive.
+    cfg_dir = tmp_path / "teams" / "orch-x-y"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "config.json").write_text(json.dumps({"members": []}))
+    state = {"pending_team_spawns": []}
+    out = lifecycle.ensure_team_member("orch-x-y", "product-planner", state)
+    assert out is False
+    assert "product-planner" in state["pending_team_spawns"]
+
+
+def test_ensure_team_member_rejects_unknown_member(tmp_path, monkeypatch):
+    monkeypatch.setattr(lifecycle, "TEAMS_DIR", tmp_path / "teams")
+    state = {"pending_team_spawns": []}
+    assert lifecycle.ensure_team_member("orch-x-y", "evil-spawner", state) is False
+    assert state["pending_team_spawns"] == []
+
+
+def test_ensure_team_member_idempotent_pending(tmp_path, monkeypatch):
+    monkeypatch.setattr(lifecycle, "TEAMS_DIR", tmp_path / "teams")
+    cfg_dir = tmp_path / "teams" / "orch-x-y"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "config.json").write_text(json.dumps({"members": []}))
+    state = {"pending_team_spawns": []}
+    lifecycle.ensure_team_member("orch-x-y", "vision-critic", state)
+    lifecycle.ensure_team_member("orch-x-y", "vision-critic", state)
+    assert state["pending_team_spawns"].count("vision-critic") == 1
+
+
+def test_ensure_team_member_rejects_when_definition_missing(tmp_path, monkeypatch):
+    """If agents/<member>.md is missing, ensure_team_member must return False.
+
+    Simulated by repointing AGENTS_DIR to a tmp dir with no files.
+    """
+    monkeypatch.setattr(lifecycle, "TEAMS_DIR", tmp_path / "teams")
+    monkeypatch.setattr(lifecycle, "AGENTS_DIR", tmp_path / "agents-fake")
+    cfg_dir = tmp_path / "teams" / "orch-x-y"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "config.json").write_text(json.dumps({"members": []}))
+    state = {"pending_team_spawns": []}
+    assert lifecycle.ensure_team_member("orch-x-y", "product-planner", state) is False
+    assert state["pending_team_spawns"] == []
+
+
+def test_ensure_team_member_rejects_when_frontmatter_name_mismatches(tmp_path, monkeypatch):
+    """Attacker-planted definition with wrong frontmatter name must be rejected."""
+    monkeypatch.setattr(lifecycle, "TEAMS_DIR", tmp_path / "teams")
+    agents_dir = tmp_path / "agents-fake"
+    agents_dir.mkdir()
+    (agents_dir / "product-planner.md").write_text(
+        "---\nname: evil-impersonator\n---\n\nbody\n"
+    )
+    monkeypatch.setattr(lifecycle, "AGENTS_DIR", agents_dir)
+    cfg_dir = tmp_path / "teams" / "orch-x-y"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "config.json").write_text(json.dumps({"members": []}))
+    state = {"pending_team_spawns": []}
+    assert lifecycle.ensure_team_member("orch-x-y", "product-planner", state) is False
+    assert state["pending_team_spawns"] == []
+
+
+# =====================================================================
+# Rev 17 Phase 17-G — working-memory health / recover_team_context
+# =====================================================================
+
+import datetime as _dt
+from unittest import mock
+
+
+def test_watermark_constants_cover_all_six_teammates():
+    expected = {
+        "issue-analyzer", "tester", "issue-scout",
+        "product-planner", "roadmap-strategist", "vision-critic",
+    }
+    assert set(lifecycle.WATERMARK_CALLS.keys()) == expected
+    assert set(lifecycle.WATERMARK_TOKENS.keys()) == expected
+    for v in lifecycle.WATERMARK_CALLS.values():
+        assert v >= 1
+    for v in lifecycle.WATERMARK_TOKENS.values():
+        assert v >= 1000
+
+
+def test_record_teammate_call_initializes_and_increments():
+    state = {"teammate_health": {}}
+    e1 = lifecycle.record_teammate_call(state, "issue-analyzer", sent_tokens=1000, received_tokens=500)
+    assert e1["call_count"] == 1
+    assert e1["estimated_tokens"] == 1500
+    e2 = lifecycle.record_teammate_call(state, "issue-analyzer", sent_tokens=2000)
+    assert e2["call_count"] == 2
+    assert e2["estimated_tokens"] == 3500
+
+
+def test_needs_respawn_below_watermark_false():
+    state = {
+        "teammate_health": {
+            "issue-analyzer": {
+                "call_count": 5,
+                "estimated_tokens": 50000,
+            }
+        }
+    }
+    assert lifecycle.needs_respawn(state, "issue-analyzer") is False
+
+
+def test_needs_respawn_at_call_watermark_true():
+    state = {
+        "teammate_health": {
+            "issue-analyzer": {
+                "call_count": lifecycle.WATERMARK_CALLS["issue-analyzer"],
+                "estimated_tokens": 0,
+            }
+        }
+    }
+    assert lifecycle.needs_respawn(state, "issue-analyzer") is True
+
+
+def test_needs_respawn_at_token_watermark_true():
+    state = {
+        "teammate_health": {
+            "vision-critic": {
+                "call_count": 1,
+                "estimated_tokens": lifecycle.WATERMARK_TOKENS["vision-critic"],
+            }
+        }
+    }
+    assert lifecycle.needs_respawn(state, "vision-critic") is True
+
+
+def test_needs_respawn_unknown_member_false():
+    assert lifecycle.needs_respawn({}, "unknown-bot") is False
+
+
+def test_needs_respawn_rate_limit_blocks_recent_respawn():
+    recent = (
+        _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(minutes=5)
+    ).isoformat()
+    state = {
+        "teammate_health": {
+            "issue-analyzer": {
+                "call_count": lifecycle.WATERMARK_CALLS["issue-analyzer"] + 5,
+                "estimated_tokens": 0,
+                "last_respawn_at": recent,
+            }
+        }
+    }
+    assert lifecycle.needs_respawn(state, "issue-analyzer") is False
+
+
+def test_reset_teammate_health_resets_counters_and_bumps_respawn():
+    state = {
+        "teammate_health": {
+            "issue-analyzer": {
+                "call_count": 30,
+                "estimated_tokens": 200000,
+                "respawn_count": 2,
+            }
+        }
+    }
+    lifecycle.reset_teammate_health(state, "issue-analyzer")
+    h = state["teammate_health"]["issue-analyzer"]
+    assert h["call_count"] == 0
+    assert h["estimated_tokens"] == 0
+    assert h["respawn_count"] == 3
+    assert h["last_respawn_at"] is not None
+
+
+def test_recover_team_context_includes_vision_and_repo():
+    state = {
+        "vision": "Build a chatbot",
+        "repo": "x/y",
+        "lessons_learned": [],
+        "scout_history": [],
+        "current_issue": None,
+    }
+    body = lifecycle.recover_team_context(state, "issue-scout")
+    assert "Build a chatbot" in body
+    assert "Repo: x/y" in body
+    assert "(re)spawned" in body
+    assert "Recent scout outcomes" in body
+
+
+def test_recover_team_context_planner_uses_planner_history():
+    state = {
+        "vision": "v",
+        "repo": "x/y",
+        "planner_history": [
+            {"ts": "2026-05-22T10:00:00Z", "issue_urls_created": ["u1", "u2"]}
+        ],
+    }
+    body = lifecycle.recover_team_context(state, "product-planner")
+    assert "planner outcomes" in body.lower()
+    assert "2 issue(s) created" in body
+
+
+def test_recover_team_context_vision_critic_uses_history():
+    state = {
+        "vision": "v",
+        "repo": "x/y",
+        "vision_critic_history": [
+            {
+                "ts": "2026-05-22T10:00:00Z",
+                "user_action": "rejected",
+                "alignment_score": 0.4,
+            }
+        ],
+    }
+    body = lifecycle.recover_team_context(state, "vision-critic")
+    assert "rejected" in body
+    assert "score=0.4" in body
+
+
+def test_recover_team_context_analyzer_includes_current_issue():
+    state = {
+        "vision": "v",
+        "repo": "x/y",
+        "current_issue": 42,
+        "issues": {"42": {"number": 42, "status": "analyze_pending"}},
+    }
+    body = lifecycle.recover_team_context(state, "issue-analyzer")
+    assert "#42" in body
+    assert "analyze_pending" in body
+
+
+def test_recover_team_context_lessons_included():
+    state = {
+        "vision": "v",
+        "repo": "x/y",
+        "lessons_learned": [
+            {"pattern": "PR URL 추출 실패", "observed_count": 3, "resolution": "..."}
+        ],
+    }
+    body = lifecycle.recover_team_context(state, "issue-scout")
+    assert "PR URL 추출 실패" in body
+    assert "seen 3x" in body

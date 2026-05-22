@@ -24,6 +24,24 @@
 >
 > **Reading shortcut**: 시간 없으면 부록 B → §9 state machine 표 → §11A → §17 Phase 0/A. **30분 안에 구현 시작 가능**.
 
+> ## ⏰ Revision 16 (2026-05-22) — Usage limit reset 후 자동 재개 메커니즘 (설계만, 구현 보류)
+>
+> 사용자 질문: "토큰 사용량이 가득차서 멈추면 자동으로 토큰 사용량이 초기화 되었을 때 재시작하는 기능이 있어?" → **현재 없음**. Claude Code의 5h usage window 도달 시 `/loop` timer도 함께 죽어 다음 사이클 자동 진행 불가. 사용자가 `설계만 먼저 추가, 구현은 보류` 선택.
+>
+> 신규 §14A 추가 (Wake 트리거 정리 직후). Phase 0 구현 단계 진입 전 정식 편입 여부 재결정. 핵심 요지:
+>
+> | 항목 | 결정 |
+> |---|---|
+> | 1차 메커니즘 | **CronCreate routine** (Claude Code 내장 schedule) — `0 */5 * * *` 등으로 `/orchestrator` 주기 호출. usage window 종료되어 있으면 fresh session에서 정상 진행, 아니면 cron fire 자체가 실패 후 다음 슬롯 자동 재시도 |
+> | 2차 메커니즘 (옵션) | OS cron + `claude -p '/orchestrator'` — Claude Code 세션 자체가 죽어도 OS 레벨 부활. 셋업 복잡 |
+> | state 확장 | `last_invocation_at`, `resumed_after_gap_log[]` (gap 통계). 신규 lock owner 검증 (`state.lock_owner` + flock atime 조합) — §10 schema 갱신 예정 |
+> | 재개 시 reconciliation | **기존 timeout 가드로 충분**. `analyze_pending`(10분) / `test_pending`(20분) / `scout_creating`(트랜잭션 lock) 등이 5h+ gap에서는 모두 timeout 분기로 자동 정리 → 신규 로직 0 |
+> | /loop과의 공존 | 중복 fire 허용. FSM 멱등성 (last_verdict_signature, merge_question_emitted, scout-fp-{hash}) 이미 redundant wake 흡수. dedup 코드 불필요 |
+> | 동시 호출 위험 | cron fire와 사용자 수동 `/orchestrator`가 겹치면 flock 경합 가능. **미해결** — §16에 등록 |
+> | 알림 | 24h 이상 gap 감지 시 Step −5에서 emit 권장 (사용자 인지) |
+>
+> Phase 0 진입 직전 사용자가 구현 옵션 (A/B/C) 중 택일 → 그때 §17 phase 추가.
+>
 > ## 🎉 Revision 15 (2026-05-22) — Rev 14 critic Round G 통합 (3명 SUFFICIENT, 1개 minor fix)
 >
 > Round G: Architecture/Security/Implementability 3명 SUFFICIENT, Edge case 1개 fix:
@@ -2440,6 +2458,122 @@ exit 0   # block 안 함, 그냥 마킹
 
 ---
 
+## 14A. Usage limit reset 후 자동 재개 (Rev 16 신설, 설계만)
+
+### 문제 정의
+Claude Code 세션은 일정 사용량 도달 시 (5h block / weekly limit) 즉시 응답 중단. `/loop` timer도 세션과 함께 죽어 §14의 wake 트리거 4종 모두 무효. state.json은 디스크 + flock으로 보존되므로 데이터 손실은 없으나, **사용자가 수동으로 `/orchestrator` 재호출하기 전까지 사이클이 멈춤**. 비전 = "사용자 개입 최소화"와 충돌.
+
+### 설계 원칙
+1. **외부 트리거 필수**: 세션 내부 메커니즘 (ScheduleWakeup, /loop)으로는 죽은 세션 부활 불가 → 세션 외부에서 깨워야 함.
+2. **신규 코드 최소화**: 기존 timeout 가드 (analyze=10분 / test=20분 / scout 15분 / merged_observing 6h) 가 5h+ gap을 자동 정리하므로 reconciliation 신규 분기 0건 목표.
+3. **멱등성 의존**: cron이 redundant fire해도 state machine의 기존 idempotency (`last_verdict_signature`, `scout-fp-{hash}`, `merge_question_emitted`) 가 흡수.
+4. **gap 측정 가능**: 사용자가 자동 재개 실효성 판단할 수 있도록 gap 로그 누적.
+
+### 옵션 A — CronCreate routine (권장)
+Claude Code 내장 schedule (routine) 기능으로 `/orchestrator` 주기 호출.
+
+```
+# 5시간 간격으로 매시 정각 fire (usage window reset cadence와 정렬)
+schedule: "0 */5 * * *"   # 또는 "0 0,5,10,15,20 * * *"
+command: "/orchestrator"  # args 없음 — vision/repo는 state.json에서 로드
+```
+
+**동작 시나리오**:
+| 상태 | cron fire 시 |
+|---|---|
+| 정상 `/loop` 운영 중 | 추가 wake 발생 → Step 1에서 last_invocation_at 비교 → gap < 5h이면 일반 사이클 진행. 멱등성 가드로 transition 중복 발생 0 |
+| Usage limit 도중 | Claude Code가 cron command 거부 (usage error) → routine system이 다음 슬롯에서 자동 재시도 |
+| Usage window reset 직후 | fresh session 생성 → /orchestrator 진입 → state.json 로드 → 직전 상태에서 정확히 재개 |
+| 세션이 다른 작업으로 점유 | cron fire 큐잉 (CronCreate 동작 명세 확인 필요 — PoC 항목) |
+
+**장점**: 셋업 1줄. Claude Code 내장이라 별도 데몬 불필요. usage limit 자체가 cron command 실패로 자연스럽게 표현됨.
+
+**단점**: CronCreate 자체가 동일 토큰 풀 사용 가능성 (미확인 — PoC 필요). 세션 단위 사용량 초과 외에 **계정 단위 한도**에 걸리면 무의미.
+
+### 옵션 B — OS cron + claude CLI (백업)
+OS 레벨 cron이 `claude -p '/orchestrator'` 또는 headless 모드로 새 세션 생성.
+
+```bash
+# crontab -e
+0 */5 * * * cd /home/sungjin/Development/loopd && claude -p '/orchestrator' >> ~/.loopd/orchestrator/cron.log 2>&1
+```
+
+**장점**: 가장 견고. Claude Code 데몬이 죽어도 OS 단위에서 부활. CronCreate 한도와 독립.
+
+**단점**: shell escape, env 변수 (CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1), 작업 디렉토리, hook 활성화 보장 등 셋업 복잡. cron job 디버깅 불편. 사용자별 환경 분기 많음.
+
+### 옵션 C — 외부 watchdog 프로세스
+별도 systemd / launchd 서비스가 state.json의 `last_invocation_at` 폴링 → 일정 gap 초과 시 `claude -p '/orchestrator'` 호출. 세밀한 제어 가능하나 설계/운영 부담 큼. **이번 단계에서 비채택**.
+
+### State 확장 (옵션 A/B 공통)
+§10 schema에 추가:
+```json
+{
+  "last_invocation_at": "2026-05-22T14:00:00Z",     // 매 /orchestrator 진입 시 갱신
+  "resumed_after_gap_log": [                          // gap 통계 (cap 50건, FIFO)
+    {"resumed_at": "...", "gap_seconds": 18900, "in_flight_status": "analyze_pending"},
+    ...
+  ],
+  "lock_owner": "session-id-or-pid",                  // 동시 호출 차단용 (§16 미해결 항목 의존)
+  "lock_acquired_at": "..."
+}
+```
+
+### Step −5 보강 (재개 감지)
+기존 §9 Step −5 (watch_list 만료 처리) 직후, 다음 검사 추가:
+```python
+if state.last_invocation_at:
+    gap = now - parse(state.last_invocation_at)
+    if gap > timedelta(hours=3):
+        state.resumed_after_gap_log.append({
+            "resumed_at": now.isoformat(),
+            "gap_seconds": int(gap.total_seconds()),
+            "in_flight_status": state.issues[state.current_issue]["status"] if state.current_issue else None,
+        })
+        state.resumed_after_gap_log = state.resumed_after_gap_log[-50:]   # FIFO cap
+        if gap > timedelta(hours=24):
+            emit(f"⏰ Resumed after {gap.total_seconds()/3600:.1f}h gap — usage limit 의심. in-flight={state.current_issue}")
+state.last_invocation_at = now.isoformat()
+state.write()
+```
+- 신규 함수: 없음. 기존 helper (`audited_write`, `emit`) 재사용.
+- 신규 분기: 없음. 통계 + 사용자 알림만.
+
+### Reconciliation — 신규 코드 0 보장
+5h+ gap 발생 시 in-flight 상태별 자동 정리:
+
+| in-flight status | gap 5h 후 동작 | 의존 기존 메커니즘 |
+|---|---|---|
+| `analyze_pending` | 10분 timeout 가드 → analyzer 재SendMessage 1회 → 다시 timeout 시 needs_human | §9 R1-A2.5 |
+| `test_pending` | 20분 timeout 가드 → tester 재SendMessage 1회 → 다시 timeout 시 uncertain verdict 강제 | §9 R5-1 |
+| `scout_creating` | flock + scout_creating_done 리스트 → 이미 생성된 후보 skip, 미생성분만 재시도 | §9 Round 1 A1.4 + §13 scouting crash recovery |
+| `merge_pending` / `human_qa` / `scout_confirm` | 24h 무응답 → `parked_awaiting_human` 자동 전이 (기존 parked 가드) | §9 R1-A2.4 |
+| `merged_observing` | watch_list expires_at 만료 시 done_final 자동 전이 | §9 Step −5 (Rev 14 F-E1) |
+| `dev_running` | β hook이 dev session 종료 시점에 inject — 이미 inject됐다면 lead context에 보존, 아니면 다음 cron에서 transcript 재스캔 (PoC-4 + R1-A1.1 분기) | §11A |
+| `split_creating` | split_creating_done 리스트 → 이미 생성된 sub-issue skip | §9 Round 1 A1.4 |
+
+**결론**: 5h gap reconciliation은 신규 코드 0줄. 기존 timeout/멱등성 가드 재사용.
+
+### /loop과의 공존
+- cron과 `/loop`는 독립적으로 fire. 둘 다 살아있으면 wake 빈도 2배지만 FSM 멱등성으로 사이드이펙트 없음 — 단 토큰 비용 증가.
+- 권장 조합:
+  - **A안 (안전 우선)**: `/loop 5m /orchestrator` + cron `0 */5 * * *`. 정상 시 5분 cadence, usage limit 후 cron이 backstop.
+  - **B안 (비용 우선)**: `/loop` 없음, cron만 (5h cadence). 자율성 떨어지지만 토큰 절약.
+
+### 미해결 (구현 전 PoC 필요)
+1. **CronCreate 토큰 풀**: routine fire가 메인 세션과 동일 usage window 소진하는지 — 만약 그렇다면 옵션 A 의미 없음, 옵션 B 강제.
+2. **CronCreate failure mode**: usage limit 도중 fire 시도 시 Claude Code 응답 (silent drop / error log / retry policy).
+3. **동시 호출 lock**: cron fire ↔ 사용자 수동 `/orchestrator` 동시 진입 시 flock 경합. 현재 state.json read-write에만 flock 보호되고, **playbook step 단위 lock 없음**. lock_owner + acquired_at 도입 필요 — `state.lock_owner != current_session_id and lock_acquired_at < 30분`이면 거부 + emit 보고.
+4. **headless `claude -p` 환경 차이**: 옵션 B 선택 시 hook이 정상 fire되는지 (β stop hook이 headless 세션에서 동작 여부 미검증).
+5. **24h gap 감지의 임계값**: 3h / 6h / 12h 중 어느 게 false alarm 최소화. 운영 데이터 수집 후 조정.
+
+### 구현 단계 (Phase 0 진입 시 결정)
+사용자가 옵션 A/B/C 중 택일하면 §17에 신규 Phase 추가:
+- **Phase 0.5 (옵션 A 선택 시)**: `routines/orchestrator-resume.json` 정의 + `last_invocation_at` 필드 추가 + Step −5 보강. **20-30분 추정**.
+- **Phase 0.5 (옵션 B 선택 시)**: `scripts/cron-wrapper.sh` + crontab 설정 가이드 + env 격리 + 로그 rotation. **1-2시간 추정**.
+
+---
+
 ## 15. 효용성 체크 계획 (사용자가 강조한 요구)
 
 ### 측정 메트릭 (3주간 사용 후 평가)
@@ -2508,6 +2642,8 @@ exit 0   # block 안 함, 그냥 마킹
 - [ ] **S2 (Scout 후보 본문 sanity)**: scout이 만든 body가 dev-task가 그대로 받을 수 있는 품질인지. 첫 구현은 lead-side 길이/구조 sanity check만. 머지률 통계로 평가 후 prompt 개선.
 - [ ] **S3 (Scout이 자기 작성 이슈를 다시 픽하는 사이클)**: scout-suggested 이슈가 처리됐을 때 history에 그 흔적이 다음 scouting 사이클에 반영되어 중복 방지 정상 동작하는지 검증.
 - [ ] **S4 (다른 윈도우/사람이 만든 이슈와의 우선순위 경합)**: scout-suggested 이슈가 사람이 만든 high priority 이슈보다 위로 가지 않도록 picker의 가중치 규칙 결정.
+- [ ] **U1 (Usage limit reset 자동 재개, Rev 16)**: §14A 설계만 추가, 구현 보류. Phase 0 진입 직전 옵션 A (CronCreate routine) / B (OS cron + claude CLI) / C (외부 watchdog) 중 택일 후 신규 Phase 0.5 추가. PoC 5건 (CronCreate 토큰 풀 / failure mode / 동시 호출 lock / headless hook / gap 임계값) 선행.
+- [ ] **U2 (동시 호출 lock, Rev 16 의존)**: cron fire ↔ 사용자 수동 `/orchestrator`가 동시 진입 시 state.json flock 경합. step 단위 lock 부재. `state.lock_owner` + `lock_acquired_at` 도입 후 stale lock (30분 초과) 자동 인수 규약 신설.
 
 ### Round 1 통합 — 추가 해결안 (구현 시 정식 편입)
 

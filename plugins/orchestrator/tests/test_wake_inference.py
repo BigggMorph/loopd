@@ -141,6 +141,60 @@ def test_read_last_task_result_returns_none_when_absent(tmp_path):
     assert wake_inference.read_last_task_result(str(p)) is None
 
 
+def test_infer_detects_product_planner_sender(tmp_path):
+    p = tmp_path / "transcript.jsonl"
+    _write_transcript(
+        p,
+        [
+            {
+                "role": "user",
+                "message": {
+                    "role": "user",
+                    "content": "[product-planner]: 4 epics proposed",
+                },
+            }
+        ],
+    )
+    reason = wake_inference.infer(str(p), {})
+    assert reason == ("teammate_reply", "product-planner")
+
+
+def test_infer_detects_roadmap_strategist_sender(tmp_path):
+    p = tmp_path / "transcript.jsonl"
+    _write_transcript(
+        p,
+        [
+            {
+                "role": "user",
+                "message": {
+                    "role": "user",
+                    "content": "[roadmap-strategist]: pre-mvp diagnosis",
+                },
+            }
+        ],
+    )
+    reason = wake_inference.infer(str(p), {})
+    assert reason == ("teammate_reply", "roadmap-strategist")
+
+
+def test_infer_detects_vision_critic_sender(tmp_path):
+    p = tmp_path / "transcript.jsonl"
+    _write_transcript(
+        p,
+        [
+            {
+                "role": "user",
+                "message": {
+                    "role": "user",
+                    "content": "## vision-critic\n\nalignment_score 0.4",
+                },
+            }
+        ],
+    )
+    reason = wake_inference.infer(str(p), {})
+    assert reason == ("teammate_reply", "vision-critic")
+
+
 def test_read_last_task_result_extracts_output(tmp_path):
     p = tmp_path / "t.jsonl"
     _write_transcript(

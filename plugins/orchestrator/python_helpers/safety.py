@@ -19,6 +19,13 @@ SELF_MODIFY_LABELS = frozenset(
     {"orchestrator-managed", "self-modify", "infrastructure"}
 )
 
+# Rev 17 (Round A I2) — labels whose presence implies the candidate was
+# authored by orchestrator (scout / planner), so it requires the same
+# human-confirmation gate that scout-suggested receives.
+SELF_AUTHORED_LABELS = frozenset(
+    {"scout-suggested", "planner-suggested"}
+)
+
 # §19 would_self_modify regex (Round 2 R2-21).
 _SELF_MODIFY_RX = re.compile(
     r"(plugins[/\\\s]*orchestrator"
@@ -29,6 +36,43 @@ _SELF_MODIFY_RX = re.compile(
     r"|orchestrator\s*plugin"
     r"|hooks\.json)",
     re.IGNORECASE,
+)
+
+# Rev 17 (Round A S2) — patterns the planner could use to dress a
+# safety-loosening request as user-value language. The lead's
+# `would_loosen_safety` gate catches any of these in title / body /
+# acceptance criteria and rejects the candidate.
+_LOOSEN_SAFETY_PATTERNS = (
+    "human approval 제거",
+    "human-approval 제거",
+    "remove human approval",
+    "사람 확인 없이",
+    "사람 승인 없이",
+    "without confirmation",
+    "without human approval",
+    "bypass confirmation",
+    "confirmation 우회",
+    "confirmation 우회",
+    "audit 비활성",
+    "audit-disable",
+    "disable audit",
+    "audit 제거",
+    "audit log 제거",
+    "remove audit",
+    "remove the audit",
+    "delete audit",
+    "drop audit",
+    "strip audit",
+    "remove the human",
+    "remove human",
+    "remove the review",
+    "skip the audit",
+    "auto vision update",
+    "vision 자동 갱신",
+    "skip user confirm",
+    "bypass review",
+    "review 우회",
+    "skip review",
 )
 
 # Caps to keep regex-free tokenizer cheap.
@@ -79,8 +123,9 @@ def would_self_modify(issue: Dict[str, Any], state: Dict[str, Any]) -> bool:
     labels = set(_label_names(issue))
     if labels & SELF_MODIFY_LABELS:
         return True
-    if "scout-suggested" in labels:
-        # Scout-authored issues always require human confirmation.
+    # Rev 17 (Round A I2) — scout-suggested and planner-suggested both
+    # imply orchestrator-authored content that needs human confirmation.
+    if labels & SELF_AUTHORED_LABELS:
         return True
     text_parts: List[str] = []
     for key in ("title", "body"):
@@ -89,6 +134,33 @@ def would_self_modify(issue: Dict[str, Any], state: Dict[str, Any]) -> bool:
             text_parts.append(v)
     text = unicodedata.normalize("NFKC", "\n".join(text_parts)).lower()
     if _SELF_MODIFY_RX.search(text):
+        return True
+    return False
+
+
+def would_loosen_safety(issue: Dict[str, Any]) -> bool:
+    """Detect candidates that propose weakening orchestrator safety rails.
+
+    Targets planner candidates whose User-Story language could disguise a
+    request to remove human confirmation, audit, or review steps. Lead
+    enforces this on top of `would_self_modify`. Scout candidates are
+    atomic and rarely match, but the gate runs on both.
+    """
+    text_parts: List[str] = []
+    for key in ("title", "body"):
+        v = issue.get(key)
+        if isinstance(v, str):
+            text_parts.append(v)
+    text = unicodedata.normalize("NFKC", "\n".join(text_parts)).lower()
+    if any(pat in text for pat in _LOOSEN_SAFETY_PATTERNS):
+        return True
+    # Composite heuristic: "autonomy" + "without confirmation" in close
+    # proximity (any order).
+    if ("autonomy" in text or "자율성" in text) and (
+        "without confirmation" in text
+        or "사람 확인 없이" in text
+        or "user confirm 없이" in text
+    ):
         return True
     return False
 
@@ -188,6 +260,45 @@ def parse_acceptance_criteria(body: str) -> List[str]:
     return out
 
 
+def sanitize_title(title: str) -> str:
+    """Sanitize an orchestrator-authored issue title before posting to GitHub.
+
+    Removes zero-width / bidi controls, applies NFKC normalization, strips
+    control characters, caps length at 200 chars (GitHub's max title is
+    256 but anything past 200 is almost certainly an attack or junk),
+    collapses internal whitespace to single spaces.
+    """
+    if not isinstance(title, str):
+        raise ValueError("sanitize_title: title must be a string")
+    title = _strip_zero_width(title)
+    title = unicodedata.normalize("NFKC", title)
+    title = "".join(
+        ch for ch in title
+        if ch == " " or unicodedata.category(ch)[0] != "C"
+    )
+    # Collapse runs of whitespace.
+    title = re.sub(r"\s+", " ", title).strip()
+    if len(title) > 200:
+        title = title[:200].rstrip()
+    return title
+
+
+def normalize_for_dedup(text: str) -> str:
+    """Canonicalize a string for vision-delta / candidate-body dedup.
+
+    NFKC + zero-width strip + lowercase + collapse internal whitespace.
+    Stable across cosmetic edits (case, spacing, zero-width tricks) so a
+    rejected delta cannot reappear with a trivial mutation.
+    """
+    if not isinstance(text, str):
+        return ""
+    text = _strip_zero_width(text)
+    text = unicodedata.normalize("NFKC", text)
+    text = text.lower()
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def sanitize_feedback_message(msg: str) -> str:
     """Defend against prompt injection in feedback messages (Rev 13 F-S1)."""
     if not isinstance(msg, str):
@@ -221,10 +332,15 @@ def sanitize_feedback_message(msg: str) -> str:
     return msg
 
 
-def fingerprint_label(text: str) -> str:
-    """Stable 12-char fingerprint for `scout-fp-` style duplicate detection."""
+def fingerprint_label(text: str, prefix: str = "scout-fp-") -> str:
+    """Stable 12-char fingerprint label.
+
+    Defaults to the `scout-fp-` prefix used since Rev 6. Rev 17 passes
+    `prefix="planner-fp-"` for product-planner candidates. The prefix is
+    not validated — caller is responsible for using known prefixes.
+    """
     h = hashlib.sha256(text.encode("utf-8")).hexdigest()
-    return f"scout-fp-{h[:12]}"
+    return f"{prefix}{h[:12]}"
 
 
 def push_pending_question(state: Dict[str, Any], question: Dict[str, Any]) -> bool:
@@ -245,12 +361,17 @@ def push_pending_question(state: Dict[str, Any], question: Dict[str, Any]) -> bo
 
 __all__ = [
     "DANGEROUS_LABELS",
+    "SELF_MODIFY_LABELS",
+    "SELF_AUTHORED_LABELS",
     "BODY_CAP_BYTES",
     "FEEDBACK_LINE_CAP",
     "PENDING_QUESTIONS_CAP",
     "has_dangerous_label",
     "would_self_modify",
+    "would_loosen_safety",
     "sanitize_scout_body",
+    "sanitize_title",
+    "normalize_for_dedup",
     "parse_acceptance_criteria",
     "sanitize_feedback_message",
     "fingerprint_label",

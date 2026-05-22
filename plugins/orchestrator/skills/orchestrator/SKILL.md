@@ -108,12 +108,53 @@ When `reflection_pending` is True and wake_reason is
 results to the user, push a `vision_reflection` pending question, clear
 the flag, and continue the normal flow.
 
-### Step −1: Daily digest (Rev 13 C2)
+### Step −1: Daily digest (Rev 13 C2) + history prune (Rev 17)
 
 If `state.last_digest_at` is None or > 24h old, emit a short markdown
 digest (yesterday's merges/rejects/scouts, in-flight statuses, attention
-items), set `state.last_digest_at = now()`, `write()`. **Do not return
-— continue.**
+items).
+
+**Rev 17 prune (run every invocation, not just daily):**
+`orchestrator_state.prune_state_history(state)` — applies FIFO cap +
+TTL to lessons_learned, scout_history, planner_history,
+roadmap_reports, vision_critic_history, feedback_log, and
+rejected_delta_hashes. Single-slot fields (`vision_critic_pending_delta`,
+`active_phase_context`) are blocklisted — never touched.
+
+**State-file size watermark**: read
+`orchestrator_state.state_file_size_bytes()` after prune.
+- `> STATE_SIZE_WARN_BYTES` (2 MB) → emit warning notice to the user.
+- `> STATE_SIZE_HARD_BYTES` (5 MB) → archive long-term history to
+  `~/.loopd/orchestrator/state_archive/<UTC-date>.json` and retain only
+  the most-recent N entries per field.
+
+Set `state.last_digest_at = now()`, `write()`. **Do not return —
+continue.**
+
+### Step −0: Teammate health check (Rev 17 Phase 17-G)
+
+For each alive teammate in
+`discover_alive_teammates(team_name) ∩ state.teammate_health.keys()`:
+
+1. If `state.pending_respawn.get(member)` is True → respawn this turn
+   (mid-cycle watermark hit, deferred from a prior teammate-reply).
+   `state.pending_respawn.pop(member)`. Proceed to step 4.
+2. Else if `lifecycle.needs_respawn(state, member)` → continue.
+   Otherwise skip this member.
+3. **In-flight guard (Round A A4)**: if any pending status references
+   this member (`analyze_pending` for analyzer, `planning_pending` for
+   planner, etc.), set `state.pending_respawn[member] = True`, `write()`,
+   skip — wait until the next turn so the reply isn't lost.
+4. **Graceful shutdown**: SendMessage(to=member,
+   body=`lifecycle.shutdown_marker(team_name)`).
+5. On next turn (when ack arrives): Agent tool re-spawn the same
+   definition. Then SendMessage with
+   `lifecycle.recover_team_context(state, member)` as the bootstrap body.
+6. `lifecycle.reset_teammate_health(state, member)`. `write()`.
+   Return — turn ends.
+
+Only one respawn per invocation (the iteration short-circuits on the
+first matching member). `write()`. Continue if no respawn was needed.
 
 ### Step 0: Parse args
 
@@ -174,6 +215,39 @@ If `state.team_name` is empty or `lifecycle.team_alive(team_name) == False`:
 - Agent(subagent_type="issue-scout", name="issue-scout", …).
 - Save `team_name`. `lifecycle.ensure_labels(repo)`.
 
+**Drain `state.pending_team_spawns` (Rev 17 lazy spawn):**
+For each member in `state.pending_team_spawns[:]`:
+- Agent tool spawn (subagent_type=member, name=member). The Agent tool
+  call ends the turn — only spawn one per invocation.
+- After the agent returns idle, `state.pending_team_spawns.remove(member)`,
+  initialize `state.teammate_health[member]` if missing, `write()`,
+  return.
+
+This pattern means lazy-spawning a teammate takes 2 turns (mark pending
++ spawn). The Stage 1/2/3 entry branches handle this by re-checking on
+the next wake.
+
+### Step 3.5: Record outgoing SendMessage (Rev 17 Phase 17-G)
+
+Whenever a branch is about to call `SendMessage(to=<teammate>, body=<text>)`,
+**before** the actual send, run:
+
+```python
+lifecycle.record_teammate_call(
+    state,
+    member=<teammate>,
+    sent_tokens=len(body) // 4,           # rough char/token approximation
+    received_tokens=0,                    # filled in on the next wake from the reply length
+)
+write_in_lock(state)
+```
+
+And whenever a `teammate_reply` wake handler parses a reply (Step 6A /
+6B / 6C / 6D), it additionally updates the receiver's
+`estimated_tokens` with `len(reply_body) // 4` via the same helper
+(`sent_tokens=0`). This is what feeds `lifecycle.needs_respawn` in
+Step −0 — without these calls the watermark cannot fire.
+
 ### Step 4: Infer wake reason
 
 ```python
@@ -199,7 +273,11 @@ warning. The picker will boost main-fix candidates by +200.
 
 ### Step 5: Mode decision
 
-If `state.mode == "scouting"` → go to **Step 6B**.
+If `state.mode == "scouting"` → go to **Step 6B** (Stage 1: scout + planner).
+
+If `state.roadmap_status` is set → go to **Step 6C** (Stage 2 dispatch).
+
+If `state.vision_check_status` is set → go to **Step 6D** (Stage 3 dispatch).
 
 Else if `state.current_issue` is set → go to **Step 6A** with the in-flight issue.
 
@@ -214,7 +292,9 @@ Else:
    - If `state.consecutive_empty_scouts >= 3` and the last empty scout
      was < 24h ago, emit a cooldown message and return.
    - Otherwise set `mode="scouting"`, `scout_status="scout_new"`,
-     `scout_started_at=now()`, `write()`, go to Step 6B.
+     `planner_status="planning_pending"` (Rev 17 Stage 1 parallel),
+     `scout_started_at=now()`, `planner_started_at=now()`,
+     `write()`, go to Step 6B.
 4. `picked = pick_best_by_vision(candidates, state.vision)` — use
    LLM thinking, see "pick_best_by_vision" below.
 5. If `safety.would_self_modify(picked, state)`, AskUserQuestion for
@@ -236,6 +316,14 @@ Skill.
 #### `("new", _)`
 Compose `directives` from lessons (last 5) + sanitized feedback (last 5);
 append `FORCE_SPLIT=true` / `FORCE_PROCESS=true` markers if set.
+
+**Rev 17 auto-FORCE_SPLIT**: before sending to analyzer, call
+`issue_picker.needs_force_split(issue, state)`. If True, append
+`FORCE_SPLIT=true` to directives automatically. This triggers analyzer's
+Rev 9 split mechanism for planner-authored Epics. Skipped when the label
+combination came from an external user (audit cross-check fails — Round
+A S3) — those still go through the regular analyze pass and the user can
+manually split.
 
 ```
 SendMessage(to="issue-analyzer",
@@ -527,38 +615,343 @@ Step 5.
 Terminal. `current_issue=None`, `completed_count += 1` (for `done` only),
 write, goto Step 5.
 
-### Step 6B: Scouting-cycle dispatch
+### Step 6B: Stage 1 dispatch — scout + product-planner (parallel)
 
-Match on `(state.scout_status, wake_reason)`:
+Rev 17 supersedes the scout-only branch. Stage 1 runs **issue-scout** and
+**product-planner** in parallel from the same `scouting` mode entry, merges
+their candidate pools (dedup), and surfaces a single user confirm.
 
-- `("scout_new", _)`: SendMessage to issue-scout with vision + repo +
-  formatted recent history; set `scout_status="scout_pending"`; return.
-- `("scout_pending", ("teammate_reply","issue-scout"))`: parse_json_tail.
-  - `status == "need_vision_clarification"`: save question, transition
-    `scout_clarify_pending`, continue.
-  - `candidates == [] or None`: scout produced nothing; transition
-    `scout_done` with a message about why.
-  - Else: stash candidates, `scout_decisions={}`, transition
-    `scout_received`, fall through.
-- `("scout_pending", _)`: 24h guard (similar to analyzer timeout).
-- `("scout_clarify_pending", _)`: AskUserQuestion the saved clarify
-  question, then resend the prompt to scout, transition `scout_pending`,
-  return.
-- `("scout_received", _)`: transition `scout_confirm_pending`, set
-  `scout_confirm_idx=0`, continue.
-- `("scout_confirm_pending", _)`:
-  - 24h guard → `scout_failed` with reason "user 24h 무응답".
-  - Wake user_input: parse selected IDs from multiSelect, set
-    `scout_decisions`, transition `scout_creating`. Continue.
-  - First entry: build multiSelect options, AskUserQuestion, return.
-- `("scout_creating", _)`: `create_issues_with_fingerprint(...)` (the
-  scout variant — `extra_labels=["scout-suggested"]`,
-  `body_prefix=None`). On exit, transition `scout_done` (or
-  `scout_failed` if any failures recorded).
-- `("scout_done"|"scout_failed", _)`: emit summary; push entry to
-  `scout_history`; update `consecutive_empty_scouts` /
-  `last_empty_scout_at`; set `mode="resolution"`,
-  clear scout fields (but keep history); write; **goto Step 5**.
+Match on `(state.scout_status, state.planner_status, wake_reason)`:
+
+#### `("scout_new", "planning_pending", _)` — initial fan-out
+1. `lifecycle.ensure_team_member(team_name, "product-planner", state)`. If
+   it returns False (`state.pending_team_spawns` was just appended) →
+   `write()`; return. Step 3 next turn will spawn the agent.
+2. SendMessage to **issue-scout** with vision + repo + format_recent_history
+   + `active_phase_context` (if set and `current_cycle <
+   active_phase_context_until_cycle`).
+3. SendMessage to **product-planner** with vision + repo +
+   `active_phase_context` + `vision_history[-5:]` +
+   `planner_history[-3:]` (title + accepted-count only).
+4. `scout_transition(state, "scout_pending")`. (No-op if already
+   `scout_pending`.)
+5. `planning_transition(state, "planning_pending")`.
+6. `write()`. Return.
+
+#### `("scout_pending", _, ("teammate_reply","issue-scout"))`
+parse_json_tail → store in `state.scout_candidates_buffer` (NOT
+`scout_candidates` yet — that's the merged pool). Set
+`scout_pending_resolved_at = now()` and `scout_transition(state,
+"scout_received")`. **Fall through** to merge check below.
+
+#### `(_, "planning_pending", ("teammate_reply","product-planner"))`
+parse_json_tail → run lead-side sanity checks (§4.1 contract):
+1. `status == "need_vision_clarification"` → push vision question to
+   pending_questions, `planning_transition(None)`, return.
+2. Each candidate must have `complexity_level >= 3` and ≥ 7 acceptance
+   criteria (count `- [ ]` lines in body); body must contain
+   `## User Story` and `## Out of Scope` sections; labels must include
+   `planner-suggested` + `split-epic` (auto-add if missing).
+3. On any structural failure: re-request (`planning_retried=True`,
+   `last_user_message body = "JSON 한 줄로 재전송"`) up to 2 times. Then
+   discard with `candidates=[]`.
+4. Run `safety.would_self_modify` AND `safety.would_loosen_safety` on
+   each candidate. Drop matches; emit a user notice naming the dropped
+   candidates and why.
+5. Sanitize: `safety.sanitize_title(c.title)` + `safety.sanitize_scout_body(c.body)`
+   on every survivor.
+6. Store in `state.planner_candidates_buffer`. Set
+   `planning_pending_resolved_at = now()`.
+7. `planning_transition(state, "planning_done")`. **Fall through.**
+
+#### Stage 1 merge check (after either reply, or idle wake)
+After either teammate replies, check if both have reported (or both have
+timed out per 5.4 timeout rules):
+
+```python
+scout_done = state.scout_candidates_buffer is not None or state.scout_pending_resolved_at
+planner_done = state.planner_candidates_buffer is not None or state.planning_pending_resolved_at
+both_resolved = scout_done and planner_done
+```
+
+If only one is done and the other is within its 10-min timeout window →
+`write()`; return (wait for the other).
+
+If `both_resolved`:
+1. `merged = playbook_helpers.dedup_candidates(state.scout_candidates_buffer or [], state.planner_candidates_buffer or [])`.
+2. Emit a user-visible note for each entry in `merged.drops` (e.g.
+   "scout c2 (Add wizard) auto-deduped against planner p1 (Onboarding
+   Epic) — similarity 0.93").
+3. `state.scout_candidates = [c for c in merged.merged if c.get("source")=="scout"]`
+   and `state.planner_candidates = [c for c in merged.merged if c.get("source")=="planner"]`.
+4. Reset `scout_candidates_buffer = None`, `planner_candidates_buffer = None`.
+5. If both lists are empty: `scout_transition("scout_done")` +
+   `planning_transition(None)` with reason "no candidates" → goto Step 5.
+6. Else build a single multiSelect (cap 8). Each option label is
+   `f"[{source}] {title} (complexity={complexity_level}, priority={priority_hint})"`.
+   `scout_transition("scout_confirm_pending")`,
+   `planning_transition("planning_pending")` (re-use the status as
+   "awaiting confirm" — `planner_status="planning_creating"` arrives on
+   user confirm). AskUserQuestion, return.
+
+#### `("scout_confirm_pending", _, ("user_input", _))` — confirm received
+Parse selected IDs. Split into scout-selected + planner-selected lists.
+Set `state.scout_decisions = {cid: True for cid in scout_selected}` and
+`state.planner_decisions = {pid: True for pid in planner_selected}`.
+
+If any scout selected → `scout_transition("scout_creating")`.
+If any planner selected → `planning_transition("planning_creating")`.
+If neither → both go straight to `*_done`/`None`.
+
+`write()`. **Fall through** to creation.
+
+#### `("scout_creating", _, _)` — register scout candidates
+Acquire `stage1_creating_lock_*` (owner-CAS, 10-min stale window).
+For each scout candidate with `decisions[c.id]=True`:
+- `plan = playbook_helpers.candidate_create_plan(c, fp_prefix="scout-fp-",
+  extra_labels=["scout-suggested"])`.
+- `gh issue list --repo <repo> --label <plan.fingerprint_label> --state all
+  --json number`. If any exist → record URL, skip create.
+- `lifecycle.ensure_split_label` not needed here. `audited_bash` →
+  `gh label create <plan.fingerprint_label>` (idempotent).
+- `audited_bash gh issue create --repo <repo> --title <plan.title>
+  --body <plan.body> --label <plan.labels>`.
+- Append URL to `state.scout_created_urls`; mark
+  `state.scout_creating_done.append(c.id)`. On error, append to
+  `state.scout_failed_creations`.
+- `write_in_lock(state)` after each candidate.
+
+On exit: `scout_transition("scout_done")` (or `"scout_failed"` if any
+failure). **Fall through** to planner creating.
+
+#### `(_, "planning_creating", _)` — register planner candidates
+Mirror the scout block with these substitutions:
+- `fp_prefix="planner-fp-"`, `extra_labels=["planner-suggested", "split-epic"]`.
+- Append to `state.planner_created_urls`,
+  `state.planner_creating_done`, `state.planner_failed_creations`.
+- All inside the same `stage1_creating_lock_*` — both creators share the
+  one lock.
+
+On exit: `planning_transition("planning_done")` (or `"planning_failed"`).
+
+#### `("scout_done"|"scout_failed", "planning_done"|"planning_failed"|None, _)` — Stage 1 finalize
+Both creators are finished:
+- Push entries:
+  - `state.scout_history.append({"ts": now(), "candidates_proposed": N,
+    "candidates_accepted": M, "issue_urls_created": state.scout_created_urls})`.
+  - `state.planner_history.append({"ts": now(), "candidates_proposed": N,
+    "candidates_accepted": M, "issue_urls_created":
+    state.planner_created_urls})`.
+- `state.last_stage1_completed_at = now()`.
+- Update `consecutive_empty_scouts` / `last_empty_scout_at` if zero
+  candidates created across both.
+- `mode="resolution"`. `playbook_helpers.clear_scout_fields(state)` and
+  `playbook_helpers.clear_planner_fields(state)`.
+- Phase 17-D will trigger Stage 2 here. For now: `write()`; goto Step 5.
+
+#### `("scout_pending", _, _)` (other wakes)
+10-min timeout (per §6.5):
+- First timeout: re-SendMessage with "JSON 한 줄로 재전송", set
+  `scout_retried` flag, reset `scout_started_at=now()`, return.
+- Second timeout: store `scout_candidates_buffer = []`,
+  `scout_pending_resolved_at = now()`, `scout_transition("scout_received")`,
+  fall through to merge.
+
+#### `(_, "planning_pending", _)` (other wakes)
+Symmetric to scout 10-min timeout. On second timeout:
+`planner_candidates_buffer = []`, `planning_pending_resolved_at = now()`,
+`planning_transition("planning_done")` (with no candidates),
+fall through to merge.
+
+#### Late reply handling (Round A E1)
+If a reply for `issue-scout` arrives but
+`state.scout_pending_resolved_at` is already set AND the merge already
+ran (e.g. `state.scout_candidates_buffer is None` because we moved on),
+**discard the reply** with a user-visible note "late scout reply — Stage 1
+already finalized, drop". Same for late planner replies.
+
+#### `("scout_clarify_pending", _, _)`
+Unchanged from Rev 16 — AskUserQuestion the saved clarify question,
+resend prompt to scout, `scout_transition("scout_pending")`, return.
+
+#### Stage 2 auto-entry (after Stage 1 finalize)
+If `state.last_stage1_completed_at` is set and `now() -
+last_stage1_completed_at < 5 min` AND
+`state.roadmap_status is None` AND `state.last_roadmap_report_cycle !=
+current_cycle`:
+
+1. `lifecycle.ensure_team_member(team_name, "roadmap-strategist", state)`.
+   If False → `write()`; return.
+2. SendMessage to **roadmap-strategist** with: vision + 50-merged-PR
+   summary (`gh pr list --state merged --limit 50 --json title,labels,mergedAt`)
+   + Stage 1 candidate-pool summary (title + complexity only) +
+   `vision_history[-5:]` + `roadmap_reports[-3:]`.
+3. `roadmap_transition(state, "roadmap_pending")`. Set
+   `state.roadmap_started_at = now()`. `write()`. Return.
+
+### Step 6C: Roadmap dispatch (Rev 17)
+
+Match on `(state.roadmap_status, wake_reason)`:
+
+#### `("roadmap_pending", ("teammate_reply","roadmap-strategist"))`
+parse_json_tail. Sanity check:
+- `status == "insufficient_history"` → push to pending_questions ("최근
+  머지 < 5건, roadmap 진단 보류"); `roadmap_transition(None)`; return.
+- `current_phase` must be one of `pre-mvp|mvp-validation|growth|mature`;
+  on failure re-request once (`roadmap_retried=True`), then drop.
+- `phase_evidence` must be non-empty; on failure re-request.
+- `phase_context_for_next_cycles` ≤ 500 chars; truncate at 500 + emit
+  notice (do NOT re-request — Round A S5).
+- Apply `safety.sanitize_feedback_message` to `phase_context_for_next_cycles`
+  before storing (Round A S5).
+
+On success:
+- Append the report to `state.roadmap_reports` (FIFO cap 10 in
+  prune_state_history).
+- Push to `state.pending_questions`: `{question: "phase context 채택? (다음
+  25 사이클 scout/planner prompt에 주입)", target: f"roadmap:{cycle}", options: [채택, 거부]}`.
+- `state.last_roadmap_report_cycle = current_cycle`.
+- `roadmap_transition(state, "roadmap_received")` then immediately
+  `roadmap_transition(state, "roadmap_done")` and `roadmap_transition(state, None)`.
+- `write()`. Return.
+
+#### `("roadmap_pending", _)` (other wake)
+10-min timeout → re-request once on first hit; on second timeout treat as
+"no report" (`roadmap_transition(None)`), emit notice.
+
+#### Step −3 phase-context acceptance handling
+When Step −3 surfaces the "phase context 채택?" question and the user
+answers:
+- 채택 → set `state.active_phase_context = report.phase_context_for_next_cycles`
+  AND `state.active_phase_context_until_cycle = current_cycle + 25`.
+- 거부 → leave `active_phase_context` unchanged; mark
+  `report.user_action = "rejected"`.
+
+### Step 6D: Vision-critic dispatch (Rev 17)
+
+#### Step −2 Stage 3 trigger
+Replace the legacy `total % 25 == 0` reflection clause with:
+
+```python
+total = state.completed_count + state.rejected_count \
+        + sum(len(h.get("created_urls") or []) for h in (state.scout_history or [])) \
+        + sum(len(h.get("issue_urls_created") or []) for h in (state.planner_history or []))
+
+# Existing D1 scout reflection (offset 0)
+if total > 0 and total % 25 == 0 and state.last_reflection_count != total:
+    SendMessage(to="issue-scout", body="REFLECTION_REQUEST: ...")
+    state.reflection_pending = True
+    state.last_reflection_count = total
+    write(); return
+
+# Rev 17 — vision-critic (offset 12)
+elif playbook_helpers.vision_critic_due(state, total, offset=12, period=25):
+    lifecycle.ensure_team_member(team_name, "vision-critic", state)
+    if "vision-critic" in state.pending_team_spawns:
+        write(); return  # next turn, Step 3 spawns it
+    SendMessage(to="vision-critic", body=<vision + vision_critic_history[-10:] + 50 merged PR titles + roadmap_reports[-5:] + feedback_log[-10:]>)
+    vision_transition(state, "vision_check_pending")
+    state.vision_check_started_at = now()
+    state.last_vision_critic_cycle = total  # set BEFORE response to prevent duplicate sends
+    write(); return
+```
+
+Also handle `/orchestrator vision-check:true` in Step 0: if not
+already `vision_check_pending`, force the trigger by setting
+`last_vision_critic_cycle = -1` and re-entering Step −2.
+
+#### `("vision_check_pending", ("teammate_reply","vision-critic"))`
+parse_json_tail. Sanity check:
+1. `status == "insufficient_data"` → emit notice to user (`{note}`);
+   `vision_transition(None)`; return. **No further checks.**
+2. `alignment_score` in [0, 1] else re-request once.
+3. `critical_questions` length ≥ 3 else re-request once.
+4. If `vision_delta.needs_update is True` then all of
+   `before`/`after`/`rationale` must be non-empty.
+5. If `vision_delta.confidence < 0.5` → force-downgrade
+   `needs_update=False`.
+
+Lead-side **self-preservation guard (Round A S6)**:
+- `guard_removed = playbook_helpers.vision_delta_violates_guard(delta)`.
+  If non-empty → `needs_update=False`, emit notice "vision delta removes
+  oversight tokens {guard_removed} — blocked".
+- If proposed delta matches a prior rejected (`find_rejected_delta_match`)
+  → `needs_update=False`, emit notice "previously rejected delta".
+
+**Alignment-score skip (User decision §9.1, option B)**:
+- If `playbook_helpers.vision_alignment_skip(alignment_score)` (i.e.
+  `> 0.8`) → record summary in `vision_critic_history` with
+  `user_action="auto_skipped"`; `vision_transition(None)`; return without
+  prompting user.
+
+**Two-call confirm gate (Round A S6)**:
+- If `playbook_helpers.two_call_confirm_required(state, delta)` returns
+  True → append history entry with `user_action="pending_second_confirm"`
+  (including `before`/`after`/`rationale`/`alignment_score`); set
+  `state.vision_critic_pending_delta = None`; `vision_transition(None)`;
+  return. (The next vision-critic call in ~25 cycles either re-confirms,
+  causing the prompt, or drops.)
+
+Otherwise, populate `state.vision_critic_pending_delta = {before, after,
+rationale, alignment_score, proposed_at: now()}`. `vision_transition(state,
+"vision_check_received")`. AskUserQuestion via `push_pending_question`
+("vision 갱신 채택?", target=f"vision-delta:{hash[:8]}", options=[채택, 거부]).
+`write()`. Return.
+
+#### `("vision_check_pending", _)` (other wake)
+10-min timeout. First hit → re-request via SendMessage. Second hit →
+`vision_transition(None)` with no delta; emit notice "vision-critic
+timeout — skipped this cycle".
+
+#### Vision delta user-confirm handling (in Step −3 flush)
+When Step −3 surfaces "vision 갱신 채택?" and the user answers:
+
+```python
+with flock_session() as state:
+    delta = state.vision_critic_pending_delta or {}
+    if user_chose("채택"):
+        prev_vision = state.get("vision") or ""
+        state["vision"] = delta.get("after") or prev_vision
+        state.setdefault("vision_history", []).append(prev_vision)
+        state.setdefault("vision_critic_history", []).append({
+            "ts": now_iso(),
+            "source": "vision_critic",
+            "before": delta.get("before"),
+            "after": delta.get("after"),
+            "rationale": delta.get("rationale"),
+            "user_action": "accepted",
+            "alignment_score": delta.get("alignment_score"),
+        })
+        audit.record_state_mutation(
+            state,
+            actor="vision-critic",
+            action="state.vision update (accepted)",
+            payload={"before": prev_vision, "after": delta.get("after"), "rationale": delta.get("rationale")},
+        )
+    else:  # rejected
+        ph.record_rejected_delta(state, delta.get("before") or "", delta.get("after") or "")
+        state.setdefault("vision_critic_history", []).append({
+            "ts": now_iso(),
+            "source": "vision_critic",
+            "before": delta.get("before"),
+            "after": delta.get("after"),
+            "rationale": delta.get("rationale"),
+            "user_action": "rejected",
+            "alignment_score": delta.get("alignment_score"),
+        })
+        if ph.count_same_before_rejections(state, delta.get("before") or "") >= 3:
+            vision_transition(state, "vision_check_parked")
+            push_pending_question("vision-critic이 동일 영역 3회+ 거부 — 일시 정지할까?", ...)
+        audit.record_state_mutation(state, actor="vision-critic",
+            action="vision delta rejected",
+            payload={"hash": (state.rejected_delta_hashes[-1] or {}).get("hash")})
+    state["vision_critic_pending_delta"] = None
+    write_in_lock(state)
+```
+
+24h+ no-response (Round A E11) → on Step −3 sweep, if
+`vision_critic_pending_delta.proposed_at > 24h ago`, commit it to
+history with `user_action="parked_expired"` and clear the slot.
 
 ---
 
@@ -592,33 +985,53 @@ recent picks via `last_picked_at` (5-minute window).
    url,createdAt --jq 'sort_by(.createdAt) | last | .url'`.
 4. All three failed → needs_human.
 
-## Common-helper sketch — create_issues_with_fingerprint
+## Common-helper sketch — `candidate_create_plan` (Python)
 
-(Live in playbook prose for clarity; implementing as a Python helper is
-fine if you prefer.)
+Use `playbook_helpers.candidate_create_plan(candidate, fp_prefix, extra_labels)`
+to compute the title / body / labels / fingerprint for a single candidate
+(pure function — no GitHub side effects). Then the lead calls the gh
+commands itself, wrapped in `audited_bash`:
 
 For each candidate where `decisions[c.id]` is true:
 
 1. If `c.id` already in `done_list_field(state_or_issue)` → skip
    (already created).
-2. Compute `fp = safety.fingerprint_label(c.title + c.body[:200])`.
-3. Pre-check: `gh issue list --repo <repo> --label <fp> --state all
-   --json number`. If any exist → record the existing URL and skip create.
+2. `plan = playbook_helpers.candidate_create_plan(c, fp_prefix=<scout-fp-|planner-fp->, extra_labels=[<source-label>])`.
+3. Pre-check: `gh issue list --repo <repo> --label <plan.fingerprint_label>
+   --state all --json number`. If any exist → record the existing URL
+   and skip create.
 4. `lifecycle.ensure_labels(repo)` once at the start; for each candidate
-   `audited_bash gh label create <fp>` (idempotent).
-5. `safe_body = safety.sanitize_scout_body((body_prefix or "") + c.body)`.
-6. `audited_bash gh issue create --repo <repo> --title <c.title>
-   --body <safe_body> --label <c.labels + extra_labels + [fp]>`.
-7. On success: append to `created_field(...)`, mark in `done_list_field(...)`.
-8. On failure: append `{candidate_id, error}` to `failed_field(...)`.
-9. **After each candidate** → `write_in_lock(state)` so a crash leaves
+   `audited_bash gh label create <plan.fingerprint_label>` (idempotent).
+5. `audited_bash gh issue create --repo <repo> --title <plan.title>
+   --body <plan.body> --label <,>.join(plan.labels)`.
+6. On success: append URL to `created_field(...)`, mark in `done_list_field(...)`.
+7. On failure: append `{candidate_id, error}` to `failed_field(...)`.
+8. **After each candidate** → `write_in_lock(state)` so a crash leaves
    recoverable state.
 
 Wrap the whole block in `flock_session()` with an
-owner-CAS `scout_creating_lock` (owner = `f"{session_id}-{pid}"`).
-If the existing owner is someone else and the lock is < 10 min old,
-return early (someone else is working on it). After 10 min, treat as
-stale and take it over.
+owner-CAS `stage1_creating_lock_*` (owner = `f"{session_id}-{pid}"`).
+Rev 17 uses a single shared lock for both scout-creating and
+planning-creating (sequential, scout first then planner) to avoid the
+two-step race. If the existing owner is someone else and the lock is
+< 10 min old, return early (someone else is working on it). After 10 min,
+treat as stale and take it over.
+
+### Dedup method (`dedup_candidates`)
+
+Stage 1 merges scout + planner pools via
+`playbook_helpers.dedup_candidates(scout_list, planner_list)`. Method:
+- Default (env unset) — `auto`: sentence-transformers if installed,
+  SequenceMatcher otherwise.
+- `ORCHESTRATOR_DEDUP_METHOD=sequence_matcher` — deterministic,
+  dependency-free.
+- `ORCHESTRATOR_DEDUP_METHOD=sentence` — required; raises ImportError if
+  sentence-transformers not installed (no silent fallback).
+- `ORCHESTRATOR_DEDUP_MODEL` — overrides the model name (default
+  `sentence-transformers/all-MiniLM-L6-v2`).
+
+Drop entries from `merged.drops` are surfaced to the user before the
+multiSelect ("scout c2 auto-deduped against planner p1 (sim 0.93)").
 
 ## When in doubt
 

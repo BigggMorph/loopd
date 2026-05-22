@@ -225,6 +225,38 @@ def audited_bash(
     return result.returncode, result.stdout, result.stderr
 
 
+def record_state_mutation(
+    state: Dict[str, Any],
+    actor: str,
+    action: str,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Append an audit entry for a non-gh state mutation (Rev 17 Round A S1).
+
+    Direct state writes — most importantly `state.vision` updates by the
+    vision-critic flow — bypass `audited_bash` (no command to run). This
+    helper records the mutation in `state.audit_log` with the same shape
+    so undo / archive flows treat it uniformly.
+
+    Caller MUST be inside an existing `flock_session()` block and MUST
+    call `write_in_lock(state)` afterward to persist the entry. This
+    helper does not acquire the lock itself.
+    """
+    entry = {
+        "at": _now_iso(),
+        "actor": actor,
+        "action": action,
+        "target": payload.get("target") if isinstance(payload, dict) else "",
+        "payload": payload or {},
+        "payload_hash": _payload_hash(payload or {}),
+        "argv": [],
+        "kind": "state_mutation",
+    }
+    state.setdefault("audit_log", []).append(entry)
+    maybe_rotate(state)
+    return entry
+
+
 def compute_undo_plan(state: Dict[str, Any], n: int) -> List[Dict[str, Any]]:
     """Return up-to-N undo plans (newest entry first).
 
@@ -251,6 +283,7 @@ def compute_undo_plan(state: Dict[str, Any], n: int) -> List[Dict[str, Any]]:
 __all__ = [
     "AUDIT_ROTATE_THRESHOLD",
     "audited_bash",
+    "record_state_mutation",
     "maybe_rotate",
     "compute_undo_plan",
 ]

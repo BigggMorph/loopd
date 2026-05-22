@@ -24,7 +24,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 ORCH_INJECT_MARKER = "ORCH_INJECT:dev_done"
-TEAMMATE_NAMES = ("issue-analyzer", "tester", "issue-scout")
+TEAMMATE_NAMES = (
+    "issue-analyzer",
+    "tester",
+    "issue-scout",
+    # Rev 17 planning layer.
+    "product-planner",
+    "roadmap-strategist",
+    "vision-critic",
+)
 
 WakeReason = Tuple[str, Optional[str]]
 
