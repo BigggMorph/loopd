@@ -149,3 +149,37 @@ def test_compute_undo_plan_for_known_actions(isolated_home):
 def test_compute_undo_plan_empty():
     assert audit.compute_undo_plan({}, 5) == []
     assert audit.compute_undo_plan({"audit_log": []}, 5) == []
+
+
+# ---------- record_state_mutation (Rev 17 Phase 17-D) ----------
+
+def test_record_state_mutation_appends_entry():
+    state = {"audit_log": []}
+    entry = audit.record_state_mutation(
+        state, actor="vision-critic", action="state.vision update (accepted)",
+        payload={"before": "old", "after": "new", "rationale": "drift"},
+    )
+    assert len(state["audit_log"]) == 1
+    assert entry["actor"] == "vision-critic"
+    assert entry["action"] == "state.vision update (accepted)"
+    assert entry["kind"] == "state_mutation"
+    assert entry["argv"] == []
+    assert entry["payload"]["after"] == "new"
+
+
+def test_record_state_mutation_handles_empty_payload():
+    state = {"audit_log": []}
+    entry = audit.record_state_mutation(
+        state, actor="orchestrator", action="test action"
+    )
+    assert entry["payload"] == {}
+    assert entry["target"] == ""
+
+
+def test_record_state_mutation_payload_hash_is_stable():
+    state1 = {"audit_log": []}
+    state2 = {"audit_log": []}
+    audit.record_state_mutation(state1, "a", "act", {"k": "v"})
+    audit.record_state_mutation(state2, "b", "act", {"k": "v"})
+    # Same payload → same hash even with different actor.
+    assert state1["audit_log"][0]["payload_hash"] == state2["audit_log"][0]["payload_hash"]

@@ -16,6 +16,7 @@ import subprocess
 from typing import Any, Dict, List, Optional
 
 import orchestrator_state
+from playbook_helpers import SPLIT_EPIC_MARKER  # single source of truth
 
 # Statuses that mean "stop processing this issue."
 _DEAD_STATUSES = {
@@ -30,11 +31,17 @@ _DEAD_STATUSES = {
 }
 
 # Labels that disqualify an issue from being picked.
+# Rev 17: `split-epic` removed — the label is now applied at planner-Epic
+# *creation*, not after split-completion, so it must remain pickable until
+# the split-epic-marker body comment is added (which we check below).
 _EXCLUDED_LABELS = {
-    "split-epic",
     "orchestrator-rejected",
     "orchestrator-skipped",
 }
+
+# Body marker re-exported from playbook_helpers; picker permanently skips
+# parent Epics that have this comment in their body (Rev 10 fix A).
+# (SPLIT_EPIC_MARKER is imported above.)
 
 _DEDUP_WINDOW_MIN = 5
 
@@ -102,6 +109,11 @@ def _label_names(issue: Dict[str, Any]) -> List[str]:
 
 
 def _is_excluded(issue: Dict[str, Any]) -> bool:
+    body = issue.get("body") or ""
+    # Rev 10 fix A — a parent Epic that has been split has this marker
+    # appended to its body; picker permanently skips.
+    if SPLIT_EPIC_MARKER in body:
+        return True
     labels = set(_label_names(issue))
     if labels & _EXCLUDED_LABELS:
         return True
@@ -113,6 +125,57 @@ def _is_excluded(issue: Dict[str, Any]) -> bool:
     ):
         return True
     return False
+
+
+def is_orchestrator_authored(issue: Dict[str, Any], state: Dict[str, Any]) -> bool:
+    """Cross-check the audit log for an `orchestrator gh issue create` entry.
+
+    Used by `needs_force_split` to confirm the planner-suggested label was
+    applied by orchestrator (and not by an external user trying to coerce
+    auto-split). Matches by issue number found in the audit entry's
+    target field or URL substring.
+    """
+    issue_num = issue.get("number")
+    if issue_num is None:
+        return False
+    num_str = str(issue_num)
+    for entry in state.get("audit_log") or []:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("action") != "gh issue create":
+            continue
+        target = str(entry.get("target") or "")
+        # `target` may be the bare number, the URL, or empty.
+        if target == num_str:
+            return True
+        if f"/issues/{num_str}" in target:
+            return True
+        # Argv fallback — gh issue create logs the full argv too.
+        argv = entry.get("argv") or []
+        if any(num_str == str(a) for a in argv):
+            return True
+    return False
+
+
+def needs_force_split(issue: Dict[str, Any], state: Dict[str, Any]) -> bool:
+    """Detect a planner Epic that must be force-split on analyzer entry.
+
+    Returns True only when ALL of:
+      - issue has both `planner-suggested` and `split-epic` labels
+      - audit_log shows orchestrator authored the issue (Round A S3:
+        external labels alone do not trigger auto-split — user confirm)
+      - issue does not yet have the SPLIT_EPIC_MARKER (already split)
+
+    Lead injects `FORCE_SPLIT=true` into the analyzer SendMessage when
+    this returns True.
+    """
+    labels = set(_label_names(issue))
+    if "planner-suggested" not in labels or "split-epic" not in labels:
+        return False
+    body = issue.get("body") or ""
+    if SPLIT_EPIC_MARKER in body:
+        return False
+    return is_orchestrator_authored(issue, state)
 
 
 def _score(issue: Dict[str, Any]) -> int:
@@ -237,4 +300,11 @@ def remember_pick(state: Dict[str, Any], num: int) -> None:
     state.setdefault("last_picked_at", {})[str(num)] = _now().isoformat()
 
 
-__all__ = ["pick", "resume_waiting_on_dep", "remember_pick"]
+__all__ = [
+    "pick",
+    "resume_waiting_on_dep",
+    "remember_pick",
+    "needs_force_split",
+    "is_orchestrator_authored",
+    "SPLIT_EPIC_MARKER",
+]

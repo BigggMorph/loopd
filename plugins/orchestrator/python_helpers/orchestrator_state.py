@@ -74,6 +74,29 @@ _SCOUT_STATUSES = {
     "scout_failed",
 }
 
+# Rev 17 — Planning layer cycle statuses (separate enums, stored on
+# state.planner_status / state.roadmap_status / state.vision_check_status).
+_PLANNING_STATUSES = {
+    "planning_pending",
+    "planning_creating",
+    "planning_done",
+    "planning_failed",
+    "planning_parked",
+}
+
+_ROADMAP_STATUSES = {
+    "roadmap_pending",
+    "roadmap_received",
+    "roadmap_done",
+}
+
+_VISION_CHECK_STATUSES = {
+    "vision_check_pending",
+    "vision_check_received",
+    "vision_check_done",
+    "vision_check_parked",
+}
+
 
 def now() -> _dt.datetime:
     return _dt.datetime.now(_dt.timezone.utc)
@@ -145,6 +168,50 @@ def _empty_state() -> Dict[str, Any]:
         "audit_log": [],
         "watch_list": [],
         "last_pr_audit_at": None,
+        # === Rev 17 (Planning layer) ===
+        # Product-planner cycle
+        "planner_status": None,
+        "planner_started_at": None,
+        "planner_candidates_buffer": None,
+        "planner_candidates": [],
+        "planner_creating_done": [],
+        "planner_creating_lock_started_at": None,
+        "planner_creating_lock_owner": None,
+        "planner_history": [],
+        "planner_decisions": {},
+        "planner_confirm_idx": 0,
+        "planner_created_urls": [],
+        "planner_failed_creations": [],
+        "planner_message": None,
+        "planning_retried": False,
+        # Stage 1 integration (scout + planner)
+        "stage1_creating_lock_started_at": None,
+        "stage1_creating_lock_owner": None,
+        "scout_candidates_buffer": None,
+        "stage1_merge_pending": False,
+        "last_stage1_completed_at": None,
+        "planning_pending_resolved_at": None,
+        "scout_pending_resolved_at": None,
+        # Roadmap cycle
+        "roadmap_status": None,
+        "roadmap_started_at": None,
+        "roadmap_reports": [],
+        "active_phase_context": None,
+        "active_phase_context_until_cycle": 0,
+        "last_roadmap_report_cycle": 0,
+        "roadmap_retried": False,
+        # Vision-critic cycle
+        "vision_check_status": None,
+        "vision_check_started_at": None,
+        "vision_critic_retried": False,
+        "vision_critic_history": [],
+        "vision_critic_pending_delta": None,
+        "last_vision_critic_cycle": 0,
+        "rejected_delta_hashes": [],
+        # Lazy spawn / teammate health (Phase 17-G)
+        "pending_team_spawns": [],
+        "teammate_health": {},
+        "pending_respawn": {},
     }
 
 
@@ -315,6 +382,49 @@ def scout_transition(state: Dict[str, Any], new_status: str) -> None:
     state["scout_status"] = new_status
 
 
+def planning_transition(state: Dict[str, Any], new_status: Optional[str]) -> None:
+    """Record a planning-cycle status transition.
+
+    Stored on `state.planner_status`. `None` (cycle end) is accepted to
+    return to idle. Otherwise validated against `_PLANNING_STATUSES`.
+    """
+    if new_status is not None and new_status not in _PLANNING_STATUSES:
+        raise ValueError(f"unknown planning status: {new_status}")
+    old = state.get("planner_status")
+    if old == new_status:
+        return
+    state.setdefault("planning_history_log", []).append(
+        {"at": _iso(now()), "from": old, "to": new_status}
+    )
+    state["planner_status"] = new_status
+
+
+def roadmap_transition(state: Dict[str, Any], new_status: Optional[str]) -> None:
+    """Record a roadmap-cycle status transition. `None` returns to idle."""
+    if new_status is not None and new_status not in _ROADMAP_STATUSES:
+        raise ValueError(f"unknown roadmap status: {new_status}")
+    old = state.get("roadmap_status")
+    if old == new_status:
+        return
+    state.setdefault("roadmap_history_log", []).append(
+        {"at": _iso(now()), "from": old, "to": new_status}
+    )
+    state["roadmap_status"] = new_status
+
+
+def vision_transition(state: Dict[str, Any], new_status: Optional[str]) -> None:
+    """Record a vision-check-cycle status transition. `None` returns to idle."""
+    if new_status is not None and new_status not in _VISION_CHECK_STATUSES:
+        raise ValueError(f"unknown vision_check status: {new_status}")
+    old = state.get("vision_check_status")
+    if old == new_status:
+        return
+    state.setdefault("vision_check_history_log", []).append(
+        {"at": _iso(now()), "from": old, "to": new_status}
+    )
+    state["vision_check_status"] = new_status
+
+
 def mark_dev_started(state: Dict[str, Any], session_id: str) -> None:
     state["dev_session_id"] = session_id
     state["dev_done_injected"] = False
@@ -343,6 +453,113 @@ def get_issue(state: Dict[str, Any], num: Any) -> Optional[Dict[str, Any]]:
     return state.get("issues", {}).get(str(num))
 
 
+# =====================================================================
+# Rev 17 Phase 17-G — long-term memory pruning
+# =====================================================================
+
+# (field, max_entries) — FIFO caps from §12.2.
+_FIFO_CAPS: Dict[str, int] = {
+    "lessons_learned": 100,
+    "scout_history": 50,
+    "scout_history_log": 200,
+    "planning_history_log": 200,
+    "roadmap_history_log": 200,
+    "vision_check_history_log": 200,
+    "vision_history": 30,
+    "vision_critic_history": 20,
+    "planner_history": 50,
+    "roadmap_reports": 10,
+    "feedback_log": 100,
+}
+
+# (field, ttl_days) — TTL prune from §12.2.
+_TTL_DAYS: Dict[str, int] = {
+    "lessons_learned": 90,
+    "vision_critic_history": 180,
+    "planner_history": 120,
+    "roadmap_reports": 90,
+    "feedback_log": 60,
+    "rejected_delta_hashes": 30,
+}
+
+# Single-slot fields that must never be touched by the pruner (Round A S7).
+_PRUNE_BLOCKLIST = frozenset(
+    {
+        "vision_critic_pending_delta",
+        "active_phase_context",
+        "current_issue",
+        "teammate_health",
+    }
+)
+
+# Soft / hard watermarks for STATE_PATH file size (§12.2).
+STATE_SIZE_WARN_BYTES = 2 * 1024 * 1024
+STATE_SIZE_HARD_BYTES = 5 * 1024 * 1024
+
+
+def prune_state_history(state: Dict[str, Any]) -> Dict[str, int]:
+    """Apply FIFO caps + TTL to long-term history fields.
+
+    Called from Step −1 once per invocation. Returns
+    `{field: pruned_count}` for digest.
+
+    Single-slot fields in `_PRUNE_BLOCKLIST` are skipped entirely
+    (Round A S7 hard guard).
+    """
+    now_dt = now()
+    pruned: Dict[str, int] = {}
+
+    for field, cap in _FIFO_CAPS.items():
+        if field in _PRUNE_BLOCKLIST:
+            continue
+        lst = state.get(field)
+        if not isinstance(lst, list):
+            continue
+        if len(lst) > cap:
+            pruned[field] = pruned.get(field, 0) + (len(lst) - cap)
+            state[field] = lst[-cap:]
+
+    for field, days in _TTL_DAYS.items():
+        if field in _PRUNE_BLOCKLIST:
+            continue
+        lst = state.get(field)
+        if not isinstance(lst, list):
+            continue
+        cutoff = (now_dt - _dt.timedelta(days=days)).isoformat()
+        before = len(lst)
+        kept: list = []
+        for entry in lst:
+            if not isinstance(entry, dict):
+                # Preserve non-dict entries (e.g. legacy list[str]
+                # vision_history).
+                kept.append(entry)
+                continue
+            ts = (
+                entry.get("ts")
+                or entry.get("last_at")
+                or entry.get("last_seen_at")
+                or entry.get("first_at")
+                or "9999"
+            )
+            if ts >= cutoff:
+                kept.append(entry)
+        if len(kept) < before:
+            pruned[field] = pruned.get(field, 0) + (before - len(kept))
+            state[field] = kept
+
+    return pruned
+
+
+def state_file_size_bytes() -> int:
+    """Return current STATE_PATH size in bytes (0 if missing)."""
+    if not STATE_PATH.exists():
+        return 0
+    try:
+        return STATE_PATH.stat().st_size
+    except OSError:
+        return 0
+
+
 def reset_to_empty() -> None:
     """Test helper — delete state.json so the next read() yields a fresh state."""
     if STATE_PATH.exists():
@@ -365,9 +582,16 @@ __all__ = [
     "write_in_lock",
     "transition",
     "scout_transition",
+    "planning_transition",
+    "roadmap_transition",
+    "vision_transition",
     "mark_dev_started",
     "mark_dev_done_injected",
     "update_issue",
     "get_issue",
     "reset_to_empty",
+    "prune_state_history",
+    "state_file_size_bytes",
+    "STATE_SIZE_WARN_BYTES",
+    "STATE_SIZE_HARD_BYTES",
 ]

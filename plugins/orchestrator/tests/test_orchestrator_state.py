@@ -121,3 +121,264 @@ def test_normalize_backfills_missing_fields(isolated_home):
     assert state["audit_log"] == []
     assert state["watch_list"] == []
     assert state["version"] == orchestrator_state.SCHEMA_VERSION
+
+
+def test_normalize_backfills_rev17_planning_fields(isolated_home):
+    """Rev 17: a pre-planning-layer state.json should auto-gain new fields."""
+    orchestrator_state.ORCHESTRATOR_DIR.mkdir(parents=True, exist_ok=True)
+    legacy = {
+        "version": 3,
+        "vision": "v",
+        "repo": "x/y",
+        "issues": {},
+        "scout_history": [],
+    }
+    orchestrator_state.STATE_PATH.write_text(json.dumps(legacy))
+    state = orchestrator_state.read()
+    # Product-planner defaults.
+    assert state["planner_status"] is None
+    assert state["planner_candidates"] == []
+    assert state["planner_history"] == []
+    # Roadmap defaults.
+    assert state["roadmap_status"] is None
+    assert state["roadmap_reports"] == []
+    assert state["active_phase_context"] is None
+    # Vision-critic defaults.
+    assert state["vision_check_status"] is None
+    assert state["vision_critic_history"] == []
+    assert state["vision_critic_pending_delta"] is None
+    assert state["rejected_delta_hashes"] == []
+    assert state["last_vision_critic_cycle"] == 0
+    # Lazy spawn / health defaults.
+    assert state["pending_team_spawns"] == []
+    assert state["teammate_health"] == {}
+    assert state["pending_respawn"] == {}
+
+
+def test_planning_transition_records_history(isolated_home):
+    state = orchestrator_state.read()
+    orchestrator_state.planning_transition(state, "planning_pending")
+    assert state["planner_status"] == "planning_pending"
+    orchestrator_state.planning_transition(state, "planning_creating")
+    assert state["planner_status"] == "planning_creating"
+    log = state["planning_history_log"]
+    assert [e["to"] for e in log] == ["planning_pending", "planning_creating"]
+
+
+def test_planning_transition_to_none_returns_to_idle(isolated_home):
+    state = orchestrator_state.read()
+    orchestrator_state.planning_transition(state, "planning_pending")
+    orchestrator_state.planning_transition(state, None)
+    assert state["planner_status"] is None
+
+
+def test_planning_transition_rejects_unknown(isolated_home):
+    state = orchestrator_state.read()
+    with pytest.raises(ValueError):
+        orchestrator_state.planning_transition(state, "totally_made_up")
+
+
+def test_planning_transition_idempotent(isolated_home):
+    state = orchestrator_state.read()
+    orchestrator_state.planning_transition(state, "planning_pending")
+    orchestrator_state.planning_transition(state, "planning_pending")
+    assert len(state["planning_history_log"]) == 1
+
+
+def test_roadmap_transition_basic(isolated_home):
+    state = orchestrator_state.read()
+    orchestrator_state.roadmap_transition(state, "roadmap_pending")
+    assert state["roadmap_status"] == "roadmap_pending"
+    orchestrator_state.roadmap_transition(state, "roadmap_received")
+    orchestrator_state.roadmap_transition(state, "roadmap_done")
+    orchestrator_state.roadmap_transition(state, None)
+    assert state["roadmap_status"] is None
+    assert len(state["roadmap_history_log"]) == 4
+
+
+def test_roadmap_transition_rejects_unknown(isolated_home):
+    state = orchestrator_state.read()
+    with pytest.raises(ValueError):
+        orchestrator_state.roadmap_transition(state, "nope")
+
+
+def test_vision_transition_basic(isolated_home):
+    state = orchestrator_state.read()
+    orchestrator_state.vision_transition(state, "vision_check_pending")
+    assert state["vision_check_status"] == "vision_check_pending"
+    orchestrator_state.vision_transition(state, "vision_check_parked")
+    assert state["vision_check_status"] == "vision_check_parked"
+
+
+def test_vision_transition_rejects_unknown(isolated_home):
+    state = orchestrator_state.read()
+    with pytest.raises(ValueError):
+        orchestrator_state.vision_transition(state, "vision_check_done_wrong")
+
+
+def test_rev17_fields_roundtrip(isolated_home):
+    """Write Rev 17 fields, read back, verify shape preserved."""
+    state = orchestrator_state.read()
+    state["planner_history"].append({
+        "ts": "2026-05-22T10:00:00Z",
+        "candidates_proposed": 3,
+        "candidates_accepted": 2,
+        "candidates_rejected": 1,
+        "issue_urls_created": ["https://github.com/x/y/issues/1"],
+    })
+    state["vision_critic_history"].append({
+        "ts": "2026-05-22T10:00:00Z",
+        "source": "vision_critic",
+        "before": "old vision",
+        "after": "new vision",
+        "rationale": "...",
+        "user_action": "accepted",
+        "alignment_score": 0.4,
+    })
+    state["vision_critic_pending_delta"] = {
+        "before": "x",
+        "after": "y",
+        "rationale": "...",
+        "alignment_score": 0.5,
+        "proposed_at": "2026-05-22T10:00:00Z",
+    }
+    state["roadmap_reports"].append({
+        "ts": "2026-05-22T10:00:00Z",
+        "current_phase": "pre-mvp",
+        "user_action": "accepted",
+    })
+    state["rejected_delta_hashes"].append({
+        "hash": "abc",
+        "before_norm": "before",
+        "after_norm": "after",
+        "rejected_at": "2026-05-22T10:00:00Z",
+        "last_seen_at": "2026-05-22T10:00:00Z",
+        "rejection_count": 1,
+    })
+    orchestrator_state.write(state)
+    state2 = orchestrator_state.read()
+    assert state2["planner_history"][0]["candidates_accepted"] == 2
+    assert state2["vision_critic_history"][0]["user_action"] == "accepted"
+    assert state2["vision_critic_pending_delta"]["after"] == "y"
+    assert state2["roadmap_reports"][0]["current_phase"] == "pre-mvp"
+    assert state2["rejected_delta_hashes"][0]["hash"] == "abc"
+
+
+# =====================================================================
+# Rev 17 Phase 17-G — prune_state_history
+# =====================================================================
+
+import datetime as _dt
+
+
+def test_prune_state_history_caps_lessons_learned_fifo(isolated_home):
+    state = orchestrator_state.read()
+    state["lessons_learned"] = [
+        {"pattern": f"p{i}", "observed_count": 1} for i in range(150)
+    ]
+    pruned = orchestrator_state.prune_state_history(state)
+    assert pruned["lessons_learned"] == 50  # 150 - 100 cap
+    assert len(state["lessons_learned"]) == 100
+    # Oldest entries dropped (FIFO).
+    assert state["lessons_learned"][0]["pattern"] == "p50"
+
+
+def test_prune_state_history_caps_scout_history(isolated_home):
+    state = orchestrator_state.read()
+    state["scout_history"] = [{"ts": "2026-05-22T10:00:00Z", "i": i} for i in range(60)]
+    pruned = orchestrator_state.prune_state_history(state)
+    assert pruned["scout_history"] == 10
+    assert len(state["scout_history"]) == 50
+
+
+def test_prune_state_history_caps_planner_history(isolated_home):
+    state = orchestrator_state.read()
+    state["planner_history"] = [{"ts": "2026-05-22T10:00:00Z", "i": i} for i in range(80)]
+    pruned = orchestrator_state.prune_state_history(state)
+    assert pruned["planner_history"] == 30
+    assert len(state["planner_history"]) == 50
+
+
+def test_prune_state_history_caps_roadmap_reports(isolated_home):
+    state = orchestrator_state.read()
+    state["roadmap_reports"] = [{"ts": "2026-05-22T10:00:00Z", "i": i} for i in range(15)]
+    pruned = orchestrator_state.prune_state_history(state)
+    assert pruned["roadmap_reports"] == 5
+    assert len(state["roadmap_reports"]) == 10
+
+
+def test_prune_state_history_ttl_drops_old_entries(isolated_home):
+    state = orchestrator_state.read()
+    state["lessons_learned"] = [
+        {"pattern": "old", "first_at": "2020-01-01T00:00:00+00:00", "last_at": "2020-01-01T00:00:00+00:00"},
+        {"pattern": "fresh", "first_at": "9999-01-01T00:00:00+00:00", "last_at": "9999-01-01T00:00:00+00:00"},
+    ]
+    pruned = orchestrator_state.prune_state_history(state)
+    assert pruned.get("lessons_learned") == 1
+    patterns = [e["pattern"] for e in state["lessons_learned"]]
+    assert patterns == ["fresh"]
+
+
+def test_prune_state_history_does_not_touch_single_slot_fields(isolated_home):
+    """Round A S7: single-slot fields are blocklisted from prune."""
+    state = orchestrator_state.read()
+    state["vision_critic_pending_delta"] = {
+        "before": "x", "after": "y", "rationale": "r"
+    }
+    state["active_phase_context"] = "Phase: mvp-validation"
+    orchestrator_state.prune_state_history(state)
+    # Single-slot fields preserved verbatim.
+    assert state["vision_critic_pending_delta"]["after"] == "y"
+    assert state["active_phase_context"] == "Phase: mvp-validation"
+
+
+def test_prune_state_history_preserves_list_str_vision_history(isolated_home):
+    """vision_history is list[str] (sources) — must not be filtered by TTL."""
+    state = orchestrator_state.read()
+    state["vision_history"] = ["v1", "v2", "v3"]
+    orchestrator_state.prune_state_history(state)
+    assert state["vision_history"] == ["v1", "v2", "v3"]
+
+
+def test_prune_state_history_ttl_drops_rejected_delta_hashes(isolated_home):
+    state = orchestrator_state.read()
+    state["rejected_delta_hashes"] = [
+        {
+            "hash": "old", "before_norm": "x", "after_norm": "y",
+            "rejected_at": "2020-01-01T00:00:00+00:00",
+            "last_seen_at": "2020-01-01T00:00:00+00:00",
+            "rejection_count": 1,
+        },
+        {
+            "hash": "fresh", "before_norm": "a", "after_norm": "b",
+            "rejected_at": "9999-01-01T00:00:00+00:00",
+            "last_seen_at": "9999-01-01T00:00:00+00:00",
+            "rejection_count": 1,
+        },
+    ]
+    pruned = orchestrator_state.prune_state_history(state)
+    assert pruned.get("rejected_delta_hashes") == 1
+    assert state["rejected_delta_hashes"][0]["hash"] == "fresh"
+
+
+def test_prune_state_history_no_op_on_empty(isolated_home):
+    state = orchestrator_state.read()
+    pruned = orchestrator_state.prune_state_history(state)
+    assert pruned == {}
+
+
+def test_state_file_size_bytes_zero_when_missing(isolated_home):
+    # Make sure no state.json exists.
+    orchestrator_state.reset_to_empty()
+    assert orchestrator_state.state_file_size_bytes() == 0
+
+
+def test_state_file_size_bytes_positive_after_write(isolated_home):
+    state = orchestrator_state.read()
+    orchestrator_state.write(state)
+    assert orchestrator_state.state_file_size_bytes() > 0
+
+
+def test_state_size_watermarks_defined():
+    assert orchestrator_state.STATE_SIZE_WARN_BYTES > 0
+    assert orchestrator_state.STATE_SIZE_HARD_BYTES > orchestrator_state.STATE_SIZE_WARN_BYTES

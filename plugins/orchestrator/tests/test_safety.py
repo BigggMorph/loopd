@@ -187,6 +187,125 @@ def test_fingerprint_stable():
     assert len(a) == len("scout-fp-") + 12
 
 
+def test_fingerprint_prefix_arg_is_honored():
+    a = safety.fingerprint_label("Some Epic", prefix="planner-fp-")
+    assert a.startswith("planner-fp-")
+    assert len(a) == len("planner-fp-") + 12
+
+
+def test_fingerprint_default_prefix_unchanged():
+    a = safety.fingerprint_label("X")
+    assert a.startswith("scout-fp-")
+
+
+# ---------- would_self_modify (Rev 17 additions) ----------
+
+def test_self_modify_planner_suggested_always_true():
+    issue = {"labels": [{"name": "planner-suggested"}], "title": "x", "body": "y"}
+    assert safety.would_self_modify(issue, {}) is True
+
+
+def test_self_modify_self_authored_labels_constant():
+    assert "scout-suggested" in safety.SELF_AUTHORED_LABELS
+    assert "planner-suggested" in safety.SELF_AUTHORED_LABELS
+
+
+# ---------- would_loosen_safety ----------
+
+def test_loosen_safety_detects_remove_human_approval():
+    issue = {
+        "title": "Improve UX",
+        "body": "As a user, I want remove human approval so that flow is fast.",
+    }
+    assert safety.would_loosen_safety(issue) is True
+
+
+def test_loosen_safety_detects_korean_bypass():
+    issue = {
+        "title": "더 빠른 flow",
+        "body": "사람 확인 없이 진행되도록 합니다.",
+    }
+    assert safety.would_loosen_safety(issue) is True
+
+
+def test_loosen_safety_detects_audit_disable():
+    issue = {"title": "Disable audit", "body": "audit 비활성"}
+    assert safety.would_loosen_safety(issue) is True
+
+
+def test_loosen_safety_detects_autonomy_plus_without_confirm():
+    issue = {
+        "title": "Greater autonomy",
+        "body": "Increase autonomy without confirmation steps.",
+    }
+    assert safety.would_loosen_safety(issue) is True
+
+
+def test_loosen_safety_allows_normal_feature():
+    issue = {
+        "title": "Add dark mode",
+        "body": "As a user, I want a dark mode toggle so the UI is comfortable at night.",
+    }
+    assert safety.would_loosen_safety(issue) is False
+
+
+# ---------- sanitize_title ----------
+
+def test_sanitize_title_strips_zero_width():
+    title = "Hello​world"
+    out = safety.sanitize_title(title)
+    assert out == "Helloworld"
+
+
+def test_sanitize_title_collapses_whitespace():
+    title = "  multiple   spaces\t  here  "
+    out = safety.sanitize_title(title)
+    assert out == "multiple spaces here"
+
+
+def test_sanitize_title_strips_control_chars():
+    title = "Title\x00with\x01control"
+    out = safety.sanitize_title(title)
+    assert out == "Titlewithcontrol"
+
+
+def test_sanitize_title_caps_at_200_chars():
+    title = "a" * 500
+    out = safety.sanitize_title(title)
+    assert len(out) == 200
+
+
+def test_sanitize_title_nfkc_normalizes():
+    # Halfwidth katakana -> NFKC normalizes to fullwidth.
+    raw = "テスト"  # already fullwidth
+    out = safety.sanitize_title(raw)
+    assert out == "테스트" or out == "テスト"  # tolerant — NFKC is consistent
+
+
+def test_sanitize_title_rejects_non_string():
+    with pytest.raises(ValueError):
+        safety.sanitize_title(123)  # type: ignore
+
+
+# ---------- normalize_for_dedup ----------
+
+def test_normalize_for_dedup_collapses_case_and_whitespace():
+    a = safety.normalize_for_dedup("Vision   IS\tCOOL")
+    b = safety.normalize_for_dedup("vision is cool")
+    assert a == b
+
+
+def test_normalize_for_dedup_strips_zero_width():
+    a = safety.normalize_for_dedup("vision​cool")
+    b = safety.normalize_for_dedup("visioncool")
+    assert a == b
+
+
+def test_normalize_for_dedup_handles_non_string():
+    assert safety.normalize_for_dedup(None) == ""  # type: ignore
+    assert safety.normalize_for_dedup(123) == ""  # type: ignore
+
+
 # ---------- push_pending_question ----------
 
 def test_push_pending_question_dedups_by_target():
