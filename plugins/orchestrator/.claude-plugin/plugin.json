@@ -1,0 +1,9 @@
+{
+  "name": "orchestrator",
+  "version": "0.1.0-experimental",
+  "description": "Autonomous GitHub issue resolution loop (experimental). Lead Claude thread + issue-analyzer / tester / issue-scout teammates + auto-invoked loopd /dev-task. See docs/orchestrator-design.md.",
+  "author": {
+    "name": "BigggMorph",
+    "email": "biggg.morph@gmail.com"
+  }
+}
