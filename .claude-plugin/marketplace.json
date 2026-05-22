@@ -1,26 +1,15 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "loopd",
-  "description": "Synchronous multi-phase dev task runner for Claude Code — planning → implementation → review in a single window with workspace-isolated git worktrees.",
+  "name": "loopd-orchestrator",
+  "description": "Experimental orchestrator plugin channel — published from the experimental/orchestrator-v1 branch so it can be updated independently of the stable loopd plugin (which lives on main).",
   "owner": {
     "name": "BigggMorph",
     "email": "biggg.morph@gmail.com"
   },
   "plugins": [
     {
-      "name": "loopd",
-      "description": "Run /dev-task to kick off a planning → implementation → review pipeline in the current Claude Code window. Synchronous, workspace-isolated execution — no daemon, no Slack bridge.",
-      "author": {
-        "name": "BigggMorph",
-        "email": "biggg.morph@gmail.com"
-      },
-      "category": "development",
-      "source": "./plugins/loopd",
-      "homepage": "https://github.com/BigggMorph/loopd"
-    },
-    {
       "name": "orchestrator",
-      "description": "Experimental autonomous GitHub issue resolution loop. Lead Claude thread + issue-analyzer / tester / issue-scout teammates auto-invoke loopd /dev-task. Requires loopd plugin and CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1.",
+      "description": "Experimental autonomous GitHub issue resolution loop. Lead Claude thread + issue-analyzer / tester / issue-scout teammates auto-invoke loopd /dev-task. Requires the stable loopd plugin to be installed separately, plus CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1.",
       "author": {
         "name": "BigggMorph",
         "email": "biggg.morph@gmail.com"
