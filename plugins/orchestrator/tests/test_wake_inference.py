@@ -195,6 +195,128 @@ def test_infer_detects_vision_critic_sender(tmp_path):
     assert reason == ("teammate_reply", "vision-critic")
 
 
+def test_infer_detects_sender_via_json_phase_without_any_prefix(tmp_path):
+    """No [name]: prefix at all — the JSON-tail phase field must still
+    let wake_inference classify the wake as ('teammate_reply', sender).
+
+    Without this fallback, every teammate reply misclassified as 'fresh'
+    and the lead silently stalled until the 10-min timeout fired.
+    """
+    p = tmp_path / "transcript.jsonl"
+    _write_transcript(
+        p,
+        [
+            {
+                "role": "user",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "Here is my analysis.\n\n"
+                        '{"phase":"analyze","status":"complete","human_needed":false}'
+                    ),
+                },
+            }
+        ],
+    )
+    reason = wake_inference.infer(str(p), {})
+    assert reason == ("teammate_reply", "issue-analyzer")
+
+
+@pytest.mark.parametrize(
+    "phase,expected_sender",
+    [
+        ("analyze", "issue-analyzer"),
+        ("test", "tester"),
+        ("scout", "issue-scout"),
+        ("reflection", "issue-scout"),
+        ("plan", "product-planner"),
+        ("roadmap", "roadmap-strategist"),
+        ("vision_check", "vision-critic"),
+    ],
+)
+def test_infer_detects_every_phase_value(tmp_path, phase, expected_sender):
+    p = tmp_path / f"transcript-{phase}.jsonl"
+    _write_transcript(
+        p,
+        [
+            {
+                "role": "user",
+                "message": {
+                    "role": "user",
+                    "content": f'{{"phase":"{phase}","status":"complete"}}',
+                },
+            }
+        ],
+    )
+    assert wake_inference.infer(str(p), {}) == ("teammate_reply", expected_sender)
+
+
+def test_infer_json_phase_handles_fenced_block(tmp_path):
+    """LLMs sometimes wrap JSON in ```json fences; the tail scan must skip
+    fence delimiters and still find the inner JSON line.
+    """
+    p = tmp_path / "transcript.jsonl"
+    _write_transcript(
+        p,
+        [
+            {
+                "role": "user",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "Result below.\n\n```json\n"
+                        '{"phase":"vision_check","status":"complete","alignment_score":0.4}\n'
+                        "```"
+                    ),
+                },
+            }
+        ],
+    )
+    assert wake_inference.infer(str(p), {}) == ("teammate_reply", "vision-critic")
+
+
+def test_infer_json_phase_unknown_value_is_fresh(tmp_path):
+    p = tmp_path / "transcript.jsonl"
+    _write_transcript(
+        p,
+        [
+            {
+                "role": "user",
+                "message": {
+                    "role": "user",
+                    "content": '{"phase":"made_up_phase","status":"complete"}',
+                },
+            }
+        ],
+    )
+    # Unknown phase — treat as not a teammate reply.
+    assert wake_inference.infer(str(p), {}) == ("fresh", None)
+
+
+def test_infer_prefix_takes_precedence_over_phase(tmp_path):
+    """If both [name]: prefix and JSON phase are present, the explicit
+    prefix wins. Prevents an attacker who controls JSON content from
+    spoofing a different sender than the harness-attributed one.
+    """
+    p = tmp_path / "transcript.jsonl"
+    _write_transcript(
+        p,
+        [
+            {
+                "role": "user",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "[tester] my verdict\n\n"
+                        '{"phase":"analyze","status":"complete"}'
+                    ),
+                },
+            }
+        ],
+    )
+    assert wake_inference.infer(str(p), {}) == ("teammate_reply", "tester")
+
+
 def test_read_last_task_result_extracts_output(tmp_path):
     p = tmp_path / "t.jsonl"
     _write_transcript(

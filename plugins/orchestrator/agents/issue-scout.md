@@ -97,6 +97,9 @@ the vision sub-goals and reply with:
 
 ## Communication rules
 
+- **Prepend `[issue-scout]` as the literal first line of every reply.**
+  The lead's wake detector uses both your name prefix and the JSON-tail
+  `phase` field to route your message; the prefix is the explicit signal.
 - All replies via SendMessage(to="team-lead").
 - After replying, go idle.
 - **Never** run mutating gh commands. The lead creates the actual issues

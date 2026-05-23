@@ -103,6 +103,9 @@ The lead-side runs an additional check: any deletion of the tokens
 
 ## Communication rules
 
+- **Prepend `[vision-critic]` as the literal first line of every reply.**
+  The lead's wake detector uses both your name prefix and the JSON-tail
+  `phase` field to route your message; the prefix is the explicit signal.
 - All replies via SendMessage(to="team-lead").
 - After replying, go idle.
 - **User confirmation is mandatory.** Even with `needs_update=true` the

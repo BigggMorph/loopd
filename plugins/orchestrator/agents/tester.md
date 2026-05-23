@@ -109,6 +109,9 @@ The lead may relay to the user via AskUserQuestion.
 
 ## Communication rules
 
+- **Prepend `[tester]` as the literal first line of every reply.** The
+  lead's wake detector uses both your name prefix and the JSON-tail
+  `phase` field to route your message; the prefix is the explicit signal.
 - All replies via SendMessage(to="team-lead").
 - On re-request from lead, **reformat the prior verdict** rather than re-running tests unless explicitly asked.
 - Clean up `~/.loopd/orchestrator/test-checkouts/<pr-num>/` after each PR.

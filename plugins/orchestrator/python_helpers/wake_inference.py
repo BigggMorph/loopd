@@ -34,6 +34,22 @@ TEAMMATE_NAMES = (
     "vision-critic",
 )
 
+# Maps the `phase` field of a teammate's JSON-tail reply to its sender slug.
+# This is the primary, contract-grounded detector — every agent prompt
+# (`agents/*.md`) already mandates a single-line JSON tail with a `phase`
+# field, so detection works even when no `[name]:` prefix is present.
+#
+# Keep in sync with the `phase:` values in each agent's output contract.
+PHASE_TO_SENDER: Dict[str, str] = {
+    "analyze": "issue-analyzer",
+    "test": "tester",
+    "scout": "issue-scout",
+    "reflection": "issue-scout",         # REFLECTION_REQUEST reply (Rev 13 D1)
+    "plan": "product-planner",
+    "roadmap": "roadmap-strategist",
+    "vision_check": "vision-critic",
+}
+
 WakeReason = Tuple[str, Optional[str]]
 
 
@@ -151,6 +167,51 @@ def _parse_teammate_sender(text: str) -> Optional[str]:
     return None
 
 
+def _parse_phase_from_json_tail(text: str) -> Optional[str]:
+    """Extract sender from the JSON tail's `phase` field.
+
+    Every agent prompt mandates that the LAST non-empty line of the reply
+    is a single-line JSON object containing a `phase` field. We parse that
+    structurally and map phase → sender via PHASE_TO_SENDER. This works
+    even when the teammate forgets to prepend a `[name]:` prefix — which
+    they currently always do, since no agent prompt instructs them
+    otherwise (see fix history: 2026-05-23).
+
+    Robust to:
+      - leading prose ("Here is my analysis: {...}")
+      - fenced code blocks (```json ... ```)
+      - trailing whitespace / blank lines after the JSON
+      - very long messages (we only scan the last few non-empty lines)
+    """
+    if not text:
+        return None
+    # Scan from the end backwards through non-empty lines for a single-line
+    # JSON object. Cap at 8 lines so an enormous prose body doesn't bog us.
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for line in reversed(lines[-8:]):
+        # Skip code-fence delimiters.
+        if line.startswith("```"):
+            continue
+        # Quick reject: only consider candidate JSON objects.
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        phase = obj.get("phase")
+        if isinstance(phase, str):
+            sender = PHASE_TO_SENDER.get(phase)
+            if sender:
+                return sender
+        # First valid JSON dict we find — even if no recognized phase, stop
+        # looking; the tail is not a teammate reply.
+        return None
+    return None
+
+
 def infer(transcript_path: str, state: Dict[str, Any]) -> WakeReason:
     if not transcript_path:
         return ("fresh", None)
@@ -170,6 +231,13 @@ def infer(transcript_path: str, state: Dict[str, Any]) -> WakeReason:
         return ("orch_hook_inject", "dev_done")
 
     sender = _parse_teammate_sender(body)
+    if sender:
+        return ("teammate_reply", sender)
+
+    # Structural fallback: when no [name]: prefix is present (the agent
+    # prompts don't actually mandate one), look at the JSON tail's `phase`
+    # field. Every teammate's output contract requires this field.
+    sender = _parse_phase_from_json_tail(body)
     if sender:
         return ("teammate_reply", sender)
 
@@ -235,4 +303,5 @@ __all__ = [
     "read_last_task_result",
     "ORCH_INJECT_MARKER",
     "TEAMMATE_NAMES",
+    "PHASE_TO_SENDER",
 ]
