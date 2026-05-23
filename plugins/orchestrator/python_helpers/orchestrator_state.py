@@ -425,7 +425,38 @@ def vision_transition(state: Dict[str, Any], new_status: Optional[str]) -> None:
     state["vision_check_status"] = new_status
 
 
+def current_session_id() -> str:
+    """Return the live Claude Code session UUID for the lead window.
+
+    Source of truth: env vars injected by the Claude Code harness. Mirrors
+    loopd's `_session_id()` precedence (loopd/python_core/loopd_core/tick.py)
+    so the value matches what the loopd Stop hook and the orchestrator Stop
+    hook both see on their payloads.
+
+    Raises:
+        RuntimeError: when neither env var is set. The lead must NOT fall
+            back to a placeholder UUID — doing so causes the orch_stop hook
+            Gate 1 (`state.dev_session_id != payload.session_id`) to
+            mismatch forever and silently break dev-done auto-resume.
+    """
+    sid = os.environ.get("LOOPD_SESSION_ID") or os.environ.get("CLAUDE_SESSION_ID")
+    if not sid:
+        raise RuntimeError(
+            "current_session_id: neither LOOPD_SESSION_ID nor CLAUDE_SESSION_ID "
+            "is set in the lead's environment. The β Stop hook requires the "
+            "real Claude Code session UUID to match dev_session_id; using a "
+            "placeholder would silently break dev-done auto-resume."
+        )
+    return sid
+
+
 def mark_dev_started(state: Dict[str, Any], session_id: str) -> None:
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise ValueError(
+            "mark_dev_started: session_id must be a non-empty string from "
+            "current_session_id(); refusing to store a placeholder that would "
+            "break the orch_stop hook Gate 1 match."
+        )
     state["dev_session_id"] = session_id
     state["dev_done_injected"] = False
     state["dev_started_at"] = _iso(now())
