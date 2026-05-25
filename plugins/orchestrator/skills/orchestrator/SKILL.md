@@ -1,6 +1,6 @@
 ---
 name: orchestrator
-description: Autonomous GitHub issue resolution lead playbook. Coordinates issue-analyzer, tester, and issue-scout teammates; auto-invokes loopd /dev-task; never enters this skill is loaded outside the /orchestrator command.
+description: Autonomous GitHub issue resolution lead playbook. Coordinates issue-analyzer, tester, issue-scout, product-planner, roadmap-strategist, and vision-critic teammates; auto-invokes loopd /dev-task. This skill is entered only via the /orchestrator slash command or the β Stop hook auto-resume signal (ORCH_INJECT:dev_done) — never load it for unrelated purposes.
 ---
 
 # Orchestrator Lead Playbook
@@ -40,7 +40,7 @@ Bash with `python3 -c`):
 
 | Module | What it gives you |
 |---|---|
-| `orchestrator_state` | `read()`, `write()`, `flock_session()`, `write_in_lock()`, `transition(issue, status)`, `mark_dev_started()`, `get_issue()`, `now()` |
+| `orchestrator_state` | `read()`, `write()`, `flock_session()`, `write_in_lock()`, `transition(issue, status)`, `current_session_id()`, `mark_dev_started()`, `get_issue()`, `now()` |
 | `wake_inference` | `infer(transcript_path, state) → (reason, sender)`, `read_last_user_message()`, `read_last_task_result()` |
 | `issue_picker` | `pick(state) → [≤5 issues]`, `resume_waiting_on_dep(state)`, `remember_pick()` |
 | `lifecycle` | `ensure_labels(repo)`, `ensure_split_label(repo, parent_num)`, `team_alive(team_name)`, `LABEL_SPEC` |
@@ -404,7 +404,20 @@ AskUserQuestion (continue Y/N), return.
 Then:
 
 ```python
-session_id = current_session_id()        # from Claude Code env
+# Source of truth: LOOPD_SESSION_ID / CLAUDE_SESSION_ID env vars injected
+# by the Claude Code harness. NEVER make up a placeholder UUID — the
+# β Stop hook Gate 1 compares this against the live payload.session_id;
+# a mismatch silently breaks dev-done auto-resume forever.
+try:
+    session_id = orchestrator_state.current_session_id()
+except RuntimeError as exc:
+    # Env var missing — refuse to start dev. Park the issue so the user
+    # can investigate; do NOT proceed with a synthetic id.
+    issue.failure_reason = f"current_session_id unavailable: {exc}"
+    transition(issue, "needs_human")
+    write(state)
+    return
+
 orchestrator_state.mark_dev_started(state, session_id)
 transition(issue, "dev_running")
 write(state)                              # MUST flush before Skill call

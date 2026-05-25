@@ -102,6 +102,45 @@ def test_mark_dev_started_sets_all_fields(isolated_home):
     assert state["dev_started_at"] is not None
 
 
+@pytest.mark.parametrize("bad", ["", "   ", "\t\n"])
+def test_mark_dev_started_rejects_empty_session_id(isolated_home, bad):
+    state = orchestrator_state.read()
+    with pytest.raises(ValueError, match="session_id must be a non-empty string"):
+        orchestrator_state.mark_dev_started(state, bad)
+
+
+def test_mark_dev_started_rejects_non_string(isolated_home):
+    state = orchestrator_state.read()
+    with pytest.raises(ValueError):
+        orchestrator_state.mark_dev_started(state, None)  # type: ignore[arg-type]
+
+
+def test_current_session_id_reads_loopd_env(monkeypatch):
+    monkeypatch.setenv("LOOPD_SESSION_ID", "abc-123")
+    monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
+    assert orchestrator_state.current_session_id() == "abc-123"
+
+
+def test_current_session_id_falls_back_to_claude_env(monkeypatch):
+    monkeypatch.delenv("LOOPD_SESSION_ID", raising=False)
+    monkeypatch.setenv("CLAUDE_SESSION_ID", "cc-uuid-9")
+    assert orchestrator_state.current_session_id() == "cc-uuid-9"
+
+
+def test_current_session_id_prefers_loopd_over_claude(monkeypatch):
+    # Mirrors loopd's _session_id() precedence so the two helpers agree.
+    monkeypatch.setenv("LOOPD_SESSION_ID", "loopd-first")
+    monkeypatch.setenv("CLAUDE_SESSION_ID", "claude-second")
+    assert orchestrator_state.current_session_id() == "loopd-first"
+
+
+def test_current_session_id_raises_when_unset(monkeypatch):
+    monkeypatch.delenv("LOOPD_SESSION_ID", raising=False)
+    monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
+    with pytest.raises(RuntimeError, match="current_session_id"):
+        orchestrator_state.current_session_id()
+
+
 def test_update_issue_atomic(isolated_home):
     orchestrator_state.update_issue(42, dev_task_prompt="fix the thing", complexity_level=1)
     state = orchestrator_state.read()

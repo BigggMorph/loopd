@@ -121,6 +121,9 @@ Avoid: scale optimizations
 
 ## Communication rules
 
+- **Prepend `[product-planner]` as the literal first line of every reply.**
+  The lead's wake detector uses both your name prefix and the JSON-tail
+  `phase` field to route your message; the prefix is the explicit signal.
 - All replies via SendMessage(to="team-lead").
 - After replying, go idle.
 - If the lead asks "JSON 한 줄로 재전송", do not re-analyze; just

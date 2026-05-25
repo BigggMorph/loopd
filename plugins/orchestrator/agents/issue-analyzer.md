@@ -88,6 +88,9 @@ If the issue has label `scout-suggested` or `split-from-#<N>`:
 
 ## Communication rules
 
+- **Prepend `[issue-analyzer]` as the literal first line of every reply.**
+  The lead's wake detector uses both your name prefix and the JSON-tail
+  `phase` field to route your message; the prefix is the explicit signal.
 - All replies go via `SendMessage(to="team-lead")`. Plain text output is
   not visible to the lead.
 - After replying, go idle — the team manager auto-reaps you.

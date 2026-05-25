@@ -40,8 +40,13 @@ LOOPD_SESSIONS_DIR = Path(os.path.expanduser("~/.loopd/sessions"))
 
 ORCH_INJECT_MESSAGE = (
     "ORCH_INJECT:dev_done\n\n"
-    "/dev-task가 완료되었습니다. `/orchestrator` 슬래시 커맨드를 호출해 "
-    "후속 단계(PR 테스트/머지/다음 이슈)를 진행하세요."
+    "[Automated orchestrator wake — internal signal to the lead Claude thread, "
+    "NOT a user-facing message. Do not relay, paraphrase, or quote this to the "
+    "user.] The loopd /dev-task pipeline has completed. You are the orchestrator "
+    "lead; immediately invoke Skill(skill=\"orchestrator\") to enter the "
+    "(\"dev_running\", (\"orch_hook_inject\", \"dev_done\")) branch of the "
+    "playbook (extract PR URL → dispatch tester → merge or merge_pending). "
+    "Proceed autonomously without prompting the user."
 )
 
 
