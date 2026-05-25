@@ -11,11 +11,11 @@ This skill auto-loads for the `issue-analyzer` teammate.
 
 ```bash
 gh issue view <N> --repo <owner/repo> \
-  --json title,body,labels,comments,assignees,milestone,reactions
+  --json title,body,labels,comments,assignees,milestone,reactionGroups
 
 gh issue list --repo <owner/repo> --state open \
-  --json number,title,labels,reactions,createdAt \
-  --jq 'sort_by(-.reactions.totalCount, .createdAt)'
+  --json number,title,labels,reactionGroups,createdAt \
+  --jq 'sort_by(-([.reactionGroups[].users.totalCount] | add // 0), .createdAt)'
 
 gh issue view <N> --comments  # comments only
 ```

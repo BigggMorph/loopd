@@ -739,8 +739,8 @@ description: GitHub 이슈 분석 시 사용하는 도구와 human-needed 판단
 # Issue Analysis Toolkit
 
 ## gh CLI commands
-- 이슈 본문: `gh issue view <num> --repo <repo> --json title,body,labels,comments,assignees,milestone,reactions`
-- 이슈 목록 + 우선순위: `gh issue list --repo <repo> --state open --json number,title,labels,reactions,createdAt --jq 'sort_by(-.reactions.totalCount, .createdAt)'`
+- 이슈 본문: `gh issue view <num> --repo <repo> --json title,body,labels,comments,assignees,milestone,reactionGroups`
+- 이슈 목록 + 우선순위: `gh issue list --repo <repo> --state open --json number,title,labels,reactionGroups,createdAt --jq 'sort_by(-([.reactionGroups[].users.totalCount] | add // 0), .createdAt)'` (gh가 `reactions` 필드를 `reactionGroups` 리스트로 리네임)
 - 코멘트만: `gh issue view <num> --comments`
 
 ## human_needed 판단 rubric (모든 항목 체크)
@@ -2048,7 +2048,7 @@ def infer(transcript_path, state):
   - **split-from-#N priority/medium**: +30
   - **scout-suggested priority/high**: +40 (사람 priority/high보다 낮음 — S4 결정)
   - **scout-suggested priority/medium**: +20
-  - **reactions.totalCount × 5**
+  - **reactionGroups 총합(`Σ users.totalCount`) × 5**
   - **good-first-issue 라벨**: +10
   - **createdAt 오래된 순**: 동점 시 tiebreaker
 - vision 컨텍스트는 lead가 LLM thinking으로 추가 재정렬 (issue_picker는 점수 상위 5개만 반환)
@@ -2921,7 +2921,7 @@ case ("dev_running", "fresh"):
 | `read_last_task_result(transcript_path)` | path | str or None | transcript JSONL의 마지막 Task 도구 결과 body 추출. orch-stop hook의 Gate 3 (review approve 시그니처 검증)용. 없으면 None (Gate 3는 보강 신호이므로 graceful fallback) (Round 3 R3-13) |
 | `parse_teammate_sender(msg)` | message dict | str or None | PoC-1 결과로 결정. 첫 구현은 body prefix `[<name>]:` 매칭 |
 | `parse_json_tail(text)` | str | dict or None | 마지막 라인 JSON 파싱. 실패 시 None |
-| `current_session_id()` | — | str | Claude Code 환경에서 session_id 획득. unavailable 시 fallback uuid |
+| `current_session_id()` | — | str | Claude Code 환경에서 session_id 획득. 우선순위 `CLAUDE_CODE_SESSION_ID`(canonical — orch_stop payload.session_id와 동일) → `LOOPD_SESSION_ID` → `CLAUDE_SESSION_ID`(legacy fallback). **셋 다 없으면 RuntimeError raise (placeholder UUID 금지)** — placeholder는 β hook Gate 1 매칭을 영구히 깨므로. lead는 ready_for_dev에서 except 시 issue를 needs_human으로 park. |
 
 ### Issue / PR
 | 함수 | 입력 | 출력 | 실패 시 |

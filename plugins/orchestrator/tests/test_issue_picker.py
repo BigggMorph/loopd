@@ -16,7 +16,7 @@ SAMPLE_ISSUES = [
         "number": 1,
         "title": "Old issue",
         "labels": [{"name": "priority/medium"}],
-        "reactions": {"totalCount": 0},
+        "reactionGroups": [],
         "createdAt": "2025-01-01T00:00:00Z",
         "updatedAt": "2025-01-01T00:00:00Z",
         "assignees": [],
@@ -27,7 +27,7 @@ SAMPLE_ISSUES = [
         "number": 2,
         "title": "Hot issue",
         "labels": [{"name": "priority/high"}, {"name": "bug"}],
-        "reactions": {"totalCount": 10},
+        "reactionGroups": [{"content": "THUMBS_UP", "users": {"totalCount": 10}}],
         "createdAt": "2025-03-01T00:00:00Z",
         "updatedAt": "2025-03-01T00:00:00Z",
         "assignees": [],
@@ -38,7 +38,7 @@ SAMPLE_ISSUES = [
         "number": 3,
         "title": "Scout suggested",
         "labels": [{"name": "scout-suggested"}, {"name": "priority/high"}],
-        "reactions": {"totalCount": 0},
+        "reactionGroups": [],
         "createdAt": "2025-04-01T00:00:00Z",
         "updatedAt": "2025-04-01T00:00:00Z",
         "assignees": [],
@@ -49,7 +49,7 @@ SAMPLE_ISSUES = [
         "number": 4,
         "title": "Has human assignee",
         "labels": [{"name": "priority/high"}],
-        "reactions": {"totalCount": 0},
+        "reactionGroups": [],
         "createdAt": "2025-05-01T00:00:00Z",
         "updatedAt": "2025-05-01T00:00:00Z",
         "assignees": [{"login": "carol"}],
@@ -60,7 +60,7 @@ SAMPLE_ISSUES = [
         "number": 5,
         "title": "Split epic (already split)",
         "labels": [{"name": "split-epic"}, {"name": "priority/high"}],
-        "reactions": {"totalCount": 0},
+        "reactionGroups": [],
         "createdAt": "2025-06-01T00:00:00Z",
         "updatedAt": "2025-06-01T00:00:00Z",
         "assignees": [],
@@ -72,7 +72,7 @@ SAMPLE_ISSUES = [
         "number": 6,
         "title": "Rejected",
         "labels": [{"name": "orchestrator-rejected"}, {"name": "priority/high"}],
-        "reactions": {"totalCount": 0},
+        "reactionGroups": [],
         "createdAt": "2025-07-01T00:00:00Z",
         "updatedAt": "2025-07-01T00:00:00Z",
         "assignees": [],
@@ -164,6 +164,40 @@ def test_remember_pick_records_timestamp():
     state = {"last_picked_at": {}}
     issue_picker.remember_pick(state, 7)
     assert "7" in state["last_picked_at"]
+
+
+# =====================================================================
+# Regression — gh renamed `reactions` -> `reactionGroups` (issue #12).
+# The sample-fixture tests above mock `_list_open_issues` wholesale, so
+# they never exercise the real `--json` field list nor the new shape.
+# These tests guard exactly that gap.
+# =====================================================================
+
+def test_list_open_issues_requests_reactiongroups_not_reactions():
+    """Requesting the stale `reactions` field makes gh exit non-zero, which
+    raises in `_run_gh` and stalls the FSM. Assert against the actual cmd."""
+    with mock.patch.object(issue_picker, "_run_gh", return_value="[]") as run_gh:
+        issue_picker._list_open_issues("owner/repo")
+    cmd = run_gh.call_args.args[0]
+    fields = cmd[cmd.index("--json") + 1].split(",")
+    assert "reactionGroups" in fields
+    assert "reactions" not in fields
+
+
+def test_score_sums_reactiongroups():
+    issue = {
+        "labels": [],
+        "reactionGroups": [
+            {"content": "THUMBS_UP", "users": {"totalCount": 7}},
+            {"content": "HEART", "users": {"totalCount": 3}},
+        ],
+    }
+    assert issue_picker._score(issue) == 50  # 10 reactions * 5, no priority labels
+
+
+def test_score_handles_missing_or_empty_reactiongroups():
+    assert issue_picker._score({"labels": []}) == 0
+    assert issue_picker._score({"labels": [], "reactionGroups": []}) == 0
 
 
 # =====================================================================

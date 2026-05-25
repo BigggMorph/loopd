@@ -404,9 +404,10 @@ AskUserQuestion (continue Y/N), return.
 Then:
 
 ```python
-# Source of truth: LOOPD_SESSION_ID / CLAUDE_SESSION_ID env vars injected
-# by the Claude Code harness. NEVER make up a placeholder UUID — the
-# β Stop hook Gate 1 compares this against the live payload.session_id;
+# Source of truth: CLAUDE_CODE_SESSION_ID (canonical; falls back to
+# LOOPD_SESSION_ID / CLAUDE_SESSION_ID) env var injected by the Claude Code
+# harness. NEVER make up a placeholder UUID — the β Stop hook Gate 1 compares
+# this against the live payload.session_id (== CLAUDE_CODE_SESSION_ID);
 # a mismatch silently breaks dev-done auto-resume forever.
 try:
     session_id = orchestrator_state.current_session_id()
