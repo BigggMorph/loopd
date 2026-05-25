@@ -85,7 +85,7 @@ def _list_open_issues(repo: str, limit: int = 50) -> List[Dict[str, Any]]:
             "--state", "open",
             "--limit", str(limit),
             "--json",
-            "number,title,labels,reactions,createdAt,updatedAt,assignees,author,body",
+            "number,title,labels,reactionGroups,createdAt,updatedAt,assignees,author,body",
         ]
     )
     try:
@@ -199,8 +199,16 @@ def _score(issue: Dict[str, Any]) -> int:
             score += 40
         elif "priority/medium" in labels:
             score += 20
-    reactions = (issue.get("reactions") or {}).get("totalCount") or 0
-    score += int(reactions) * 5
+    # gh renamed `reactions` -> `reactionGroups`: a list of
+    # {"content": "THUMBS_UP", "users": {"totalCount": N}}. Sum every group's
+    # count to preserve the original "any reaction = engagement, x5" scoring.
+    groups = issue.get("reactionGroups") or []
+    reactions_total = sum(
+        ((g.get("users") or {}).get("totalCount") or 0)
+        for g in groups
+        if isinstance(g, dict)
+    )
+    score += int(reactions_total) * 5
     if "good-first-issue" in labels:
         score += 10
     return score

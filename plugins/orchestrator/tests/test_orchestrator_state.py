@@ -134,9 +134,23 @@ def test_current_session_id_prefers_loopd_over_claude(monkeypatch):
     assert orchestrator_state.current_session_id() == "loopd-first"
 
 
+def test_current_session_id_reads_claude_code_env(monkeypatch):
+    # CLAUDE_CODE_SESSION_ID is the canonical harness var (== hook payload).
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "ccsid-uuid")
+    assert orchestrator_state.current_session_id() == "ccsid-uuid"
+
+
+def test_current_session_id_prefers_claude_code_over_legacy(monkeypatch):
+    # The canonical var must win — it is what orch_stop's payload.session_id
+    # carries, so storing it is what makes Gate 1 match.
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "canonical")
+    monkeypatch.setenv("LOOPD_SESSION_ID", "loopd-legacy")
+    monkeypatch.setenv("CLAUDE_SESSION_ID", "claude-legacy")
+    assert orchestrator_state.current_session_id() == "canonical"
+
+
 def test_current_session_id_raises_when_unset(monkeypatch):
-    monkeypatch.delenv("LOOPD_SESSION_ID", raising=False)
-    monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
+    # conftest already clears all three session vars; this asserts the raise.
     with pytest.raises(RuntimeError, match="current_session_id"):
         orchestrator_state.current_session_id()
 

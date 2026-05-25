@@ -15,7 +15,7 @@ orchestrator after PR review:
 
 The chain under test (one test, one scenario):
 
-  1. Harness sets CLAUDE_SESSION_ID env var (simulated via monkeypatch).
+  1. Harness sets CLAUDE_CODE_SESSION_ID env var (simulated via monkeypatch).
   2. Lead resolves it via orchestrator_state.current_session_id().
   3. Lead persists it via mark_dev_started().
   4. loopd creates ~/.loopd/sessions/<sid>.json (dev pipeline starts).
@@ -61,9 +61,10 @@ def _run_hook(session_id: str, transcript_path: Path, env_home: Path) -> subproc
 
 def test_dev_done_full_wire_end_to_end(isolated_home, tmp_path, monkeypatch):
     # ── 1. Harness env: the live Claude Code session UUID ────────────────
+    # CLAUDE_CODE_SESSION_ID is the canonical var the harness injects and the
+    # value the orch_stop payload.session_id carries (conftest cleared the rest).
     real_sid = "harness-session-uuid-abc123"
-    monkeypatch.setenv("CLAUDE_SESSION_ID", real_sid)
-    monkeypatch.delenv("LOOPD_SESSION_ID", raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", real_sid)
 
     # ── 2. Lead resolves the session id via the helper (NOT a placeholder)
     resolved = orchestrator_state.current_session_id()
@@ -156,6 +157,7 @@ def test_lead_refuses_to_start_dev_without_session_env(isolated_home, monkeypatc
     must NOT fall back to any placeholder. This guards against Bug #1
     coming back via a different code path.
     """
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
     monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
     monkeypatch.delenv("LOOPD_SESSION_ID", raising=False)
 

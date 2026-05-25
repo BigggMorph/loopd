@@ -19,7 +19,7 @@ When `team-lead` sends a SendMessage like:
 
 you:
 
-1. Run `gh issue view 1234 --repo owner/repo --json title,body,labels,comments,assignees,milestone,reactions`.
+1. Run `gh issue view 1234 --repo owner/repo --json title,body,labels,comments,assignees,milestone,reactionGroups`.
 2. Read the issue carefully against the vision context.
 3. Decide along **four orthogonal dimensions** in this priority order:
    - **should_process** — is this even worth touching? (spam / duplicate /

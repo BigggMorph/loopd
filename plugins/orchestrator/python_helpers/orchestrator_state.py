@@ -428,24 +428,33 @@ def vision_transition(state: Dict[str, Any], new_status: Optional[str]) -> None:
 def current_session_id() -> str:
     """Return the live Claude Code session UUID for the lead window.
 
-    Source of truth: env vars injected by the Claude Code harness. Mirrors
-    loopd's `_session_id()` precedence (loopd/python_core/loopd_core/tick.py)
-    so the value matches what the loopd Stop hook and the orchestrator Stop
-    hook both see on their payloads.
+    Source of truth: env vars injected by the Claude Code harness.
+    `CLAUDE_CODE_SESSION_ID` is the canonical, current var name — it is
+    guaranteed identical to the `session_id` field that every hook payload
+    carries, so the orch_stop hook Gate 1 (`state.dev_session_id ==
+    payload.session_id`) matches when the lead stores this value. The legacy
+    `LOOPD_SESSION_ID` / `CLAUDE_SESSION_ID` names are kept as fallbacks for
+    older harnesses / loopd-exported environments (loopd's own `_session_id()`
+    omits the canonical name but resolves session ids from hook payloads, not
+    this env, so it is unaffected).
 
     Raises:
-        RuntimeError: when neither env var is set. The lead must NOT fall
-            back to a placeholder UUID — doing so causes the orch_stop hook
-            Gate 1 (`state.dev_session_id != payload.session_id`) to
+        RuntimeError: when none of the env vars is set. The lead must NOT
+            fall back to a placeholder UUID — doing so causes Gate 1 to
             mismatch forever and silently break dev-done auto-resume.
     """
-    sid = os.environ.get("LOOPD_SESSION_ID") or os.environ.get("CLAUDE_SESSION_ID")
+    sid = (
+        os.environ.get("CLAUDE_CODE_SESSION_ID")
+        or os.environ.get("LOOPD_SESSION_ID")
+        or os.environ.get("CLAUDE_SESSION_ID")
+    )
     if not sid:
         raise RuntimeError(
-            "current_session_id: neither LOOPD_SESSION_ID nor CLAUDE_SESSION_ID "
-            "is set in the lead's environment. The β Stop hook requires the "
-            "real Claude Code session UUID to match dev_session_id; using a "
-            "placeholder would silently break dev-done auto-resume."
+            "current_session_id: none of CLAUDE_CODE_SESSION_ID, "
+            "LOOPD_SESSION_ID, CLAUDE_SESSION_ID is set in the lead's "
+            "environment. The β Stop hook requires the real Claude Code "
+            "session UUID to match dev_session_id; using a placeholder would "
+            "silently break dev-done auto-resume."
         )
     return sid
 
