@@ -155,6 +155,87 @@ def test_current_session_id_raises_when_unset(monkeypatch):
         orchestrator_state.current_session_id()
 
 
+def _write_transcript(home: Path, slug: str, uuid: str, cwd: str) -> Path:
+    """Create ~/.claude/projects/<slug>/<uuid>.jsonl with one cwd-bearing event."""
+    proj = home / ".claude" / "projects" / slug
+    proj.mkdir(parents=True, exist_ok=True)
+    path = proj / f"{uuid}.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "sessionId": uuid,
+                "cwd": cwd,
+                "message": {"role": "user", "content": "hi"},
+            }
+        )
+        + "\n"
+    )
+    return path
+
+
+def test_current_session_id_fallback_matches_transcript(isolated_home):
+    # (a) env unset + transcript whose cwd == our cwd → returns its sessionId.
+    cwd = os.path.realpath(os.getcwd())
+    _write_transcript(isolated_home, "proj-a", "uuid-from-transcript", cwd)
+    assert orchestrator_state.current_session_id() == "uuid-from-transcript"
+
+
+def test_current_session_id_env_wins_over_transcript(isolated_home, monkeypatch):
+    # (b) env present → returns env value; fallback not consulted even with a
+    #     matching transcript on disk.
+    cwd = os.path.realpath(os.getcwd())
+    _write_transcript(isolated_home, "proj-a", "uuid-from-transcript", cwd)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "env-wins")
+    assert orchestrator_state.current_session_id() == "env-wins"
+
+
+def test_current_session_id_fallback_cwd_mismatch_raises(isolated_home):
+    # (c) env unset + only transcript points at a different cwd → raises.
+    _write_transcript(isolated_home, "proj-a", "uuid-elsewhere", "/some/other/dir")
+    with pytest.raises(RuntimeError, match="current_session_id"):
+        orchestrator_state.current_session_id()
+
+
+def test_current_session_id_fallback_no_projects_dir_raises(isolated_home):
+    # (d) env unset + ~/.claude/projects absent → raises (glob must not crash).
+    assert not orchestrator_state.CLAUDE_PROJECTS_DIR.exists()
+    with pytest.raises(RuntimeError, match="current_session_id"):
+        orchestrator_state.current_session_id()
+
+
+def test_current_session_id_fallback_two_fresh_same_cwd_is_ambiguous(isolated_home):
+    # (e) two recently-flushed same-cwd transcripts → concurrent windows,
+    #     ambiguous → raises rather than guess (a wrong UUID breaks Gate 1).
+    cwd = os.path.realpath(os.getcwd())
+    _write_transcript(isolated_home, "proj-a", "uuid-a", cwd)
+    _write_transcript(isolated_home, "proj-b", "uuid-b", cwd)
+    with pytest.raises(RuntimeError, match="current_session_id"):
+        orchestrator_state.current_session_id()
+
+
+def test_current_session_id_fallback_stale_transcript_raises(isolated_home):
+    # (f) the only same-cwd transcript is older than the freshness window →
+    #     not trusted as the live session → raises (loud park, not silent wrong).
+    cwd = os.path.realpath(os.getcwd())
+    stale = _write_transcript(isolated_home, "proj-a", "uuid-stale", cwd)
+    os.utime(stale, (1_000, 1_000))  # epoch ~1970, far outside freshness window
+    with pytest.raises(RuntimeError, match="current_session_id"):
+        orchestrator_state.current_session_id()
+
+
+def test_current_session_id_fallback_fresh_wins_over_stale(isolated_home):
+    # (g) one stale + one fresh same-cwd transcript → recency filter drops the
+    #     stale, leaving exactly one fresh match → returns the live sessionId.
+    #     (This is the real-machine scenario: many old transcripts for the repo
+    #     plus the one currently-active session.)
+    cwd = os.path.realpath(os.getcwd())
+    stale = _write_transcript(isolated_home, "proj-old", "uuid-stale", cwd)
+    os.utime(stale, (1_000, 1_000))
+    _write_transcript(isolated_home, "proj-live", "uuid-live", cwd)  # mtime=now
+    assert orchestrator_state.current_session_id() == "uuid-live"
+
+
 def test_update_issue_atomic(isolated_home):
     orchestrator_state.update_issue(42, dev_task_prompt="fix the thing", complexity_level=1)
     state = orchestrator_state.read()

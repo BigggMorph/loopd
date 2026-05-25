@@ -29,6 +29,10 @@ STATE_PATH = ORCHESTRATOR_DIR / "state.json"
 LOCK_PATH = ORCHESTRATOR_DIR / "state.lock"
 AUDIT_ARCHIVE_DIR = ORCHESTRATOR_DIR / "audit_archive"
 SENTINEL_DEV_DONE = ORCHESTRATOR_DIR / "dev_done_pending.flag"
+# Where Claude Code writes per-session transcripts (~/.claude/projects/<slug>/
+# <session-uuid>.jsonl). Used only as a fallback by current_session_id() when
+# the harness fails to inject a session env var (issue #14).
+CLAUDE_PROJECTS_DIR = Path(os.path.expanduser("~/.claude/projects"))
 
 _ACTIVE_STATUSES = {
     "new",
@@ -425,10 +429,99 @@ def vision_transition(state: Dict[str, Any], new_status: Optional[str]) -> None:
     state["vision_check_status"] = new_status
 
 
+# Fallback recency window (seconds): only transcripts whose file was flushed
+# within this many seconds are trusted to belong to the live session. Long
+# enough to absorb the harness's transcript-flush lag during an active turn,
+# short enough that a recently-closed unrelated session is unlikely to fall
+# inside it. When the live session's transcript is momentarily un-flushed it can
+# briefly look older than a stale same-cwd transcript, so we never pick "newest
+# mtime" blindly — see `_session_id_from_transcript`.
+_TRANSCRIPT_FRESHNESS_S = 300
+
+
+def _match_transcript_cwd(path: Path, cwd: str) -> Optional[str]:
+    """Return the session UUID if `path`'s latest cwd-bearing event matches `cwd`.
+
+    Reads only the tail (~200 lines) of the JSONL transcript. The latest event
+    that carries both a `cwd` and a `sessionId` decides the match: if its cwd
+    equals ours, return its `sessionId` (== the filename stem == the value the
+    orch_stop hook payload carries); if it points elsewhere, this transcript
+    belongs to another window — return None without consulting older lines.
+
+    Malformed lines (transcripts can be truncated mid-write) and event types
+    without cwd/sessionId (`file-history-snapshot`, `ai-title`, ...) are
+    skipped. stdlib-only on purpose — this module is imported by the Stop hook.
+    """
+    try:
+        with path.open("r", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return None
+    for line in reversed(lines[-200:]):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        ev_cwd = event.get("cwd")
+        sid = event.get("sessionId")
+        if not ev_cwd or not sid:
+            continue
+        try:
+            ev_cwd_real = os.path.realpath(ev_cwd)
+        except OSError:
+            ev_cwd_real = ev_cwd
+        return sid if ev_cwd_real == cwd else None
+    return None
+
+
+def _session_id_from_transcript() -> Optional[str]:
+    """Recover the live session UUID from disk, or None when it's ambiguous.
+
+    Fallback for harness builds (observed on Claude Code 2.1.116) that inject
+    none of the session env vars into the lead shell. The transcript filename
+    stem is the session UUID and equals the orch_stop hook payload.session_id,
+    so a value recovered here keeps Gate 1 matching — never a placeholder.
+
+    The project-dir slug cannot be reconstructed from cwd reliably (it maps
+    both '/' and '.' to '-'), so instead of guessing the slug we glob every
+    transcript and keep those (a) flushed within `_TRANSCRIPT_FRESHNESS_S` and
+    (b) whose latest cwd-bearing event matches our cwd. We return a UUID ONLY
+    when exactly one such transcript exists — that is unambiguously the live
+    session. Zero (the live transcript hasn't been flushed recently) or two-plus
+    (concurrent same-cwd windows) is ambiguous: we return None so the caller
+    parks loudly (needs_human, recoverable) rather than risk a wrong UUID that
+    would silently break orch_stop Gate 1 forever, exactly like a placeholder.
+    """
+    try:
+        cwd = os.path.realpath(os.getcwd())
+    except OSError:
+        return None
+    if not CLAUDE_PROJECTS_DIR.is_dir():
+        return None
+    cutoff = time.time() - _TRANSCRIPT_FRESHNESS_S
+    matches: set = set()
+    for path in CLAUDE_PROJECTS_DIR.glob("*/*.jsonl"):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if mtime < cutoff:
+            continue  # stale — too old to be the live session
+        sid = _match_transcript_cwd(path, cwd)
+        if sid is not None:
+            matches.add(sid)
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
 def current_session_id() -> str:
     """Return the live Claude Code session UUID for the lead window.
 
-    Source of truth: env vars injected by the Claude Code harness.
+    PRIMARY source: env vars injected by the Claude Code harness.
     `CLAUDE_CODE_SESSION_ID` is the canonical, current var name — it is
     guaranteed identical to the `session_id` field that every hook payload
     carries, so the orch_stop hook Gate 1 (`state.dev_session_id ==
@@ -438,25 +531,41 @@ def current_session_id() -> str:
     omits the canonical name but resolves session ids from hook payloads, not
     this env, so it is unaffected).
 
+    FALLBACK (only when all three env vars are unset): some harness builds
+    (observed on Claude Code 2.1.116) inject none of them into the lead shell.
+    We then recover the UUID from disk when — and only when — it is
+    unambiguous: exactly one recently-flushed transcript's latest cwd-bearing
+    event matches our cwd (see `_session_id_from_transcript`). The recovered
+    value is the real UUID, so Gate 1 still matches. When the on-disk evidence
+    is ambiguous (no fresh transcript, or several concurrent same-cwd windows)
+    the fallback declines and this function raises, so the lead parks loudly
+    instead of risking a wrong UUID.
+
     Raises:
-        RuntimeError: when none of the env vars is set. The lead must NOT
-            fall back to a placeholder UUID — doing so causes Gate 1 to
-            mismatch forever and silently break dev-done auto-resume.
+        RuntimeError: when the env vars are unset AND no single fresh transcript
+            unambiguously matches the current working directory. The lead must
+            NOT fall back to a placeholder (or a guessed) UUID — a wrong value
+            makes Gate 1 mismatch forever and silently breaks dev-done
+            auto-resume.
     """
     sid = (
         os.environ.get("CLAUDE_CODE_SESSION_ID")
         or os.environ.get("LOOPD_SESSION_ID")
         or os.environ.get("CLAUDE_SESSION_ID")
     )
-    if not sid:
-        raise RuntimeError(
-            "current_session_id: none of CLAUDE_CODE_SESSION_ID, "
-            "LOOPD_SESSION_ID, CLAUDE_SESSION_ID is set in the lead's "
-            "environment. The β Stop hook requires the real Claude Code "
-            "session UUID to match dev_session_id; using a placeholder would "
-            "silently break dev-done auto-resume."
-        )
-    return sid
+    if sid:
+        return sid
+    sid = _session_id_from_transcript()
+    if sid:
+        return sid
+    raise RuntimeError(
+        "current_session_id: none of CLAUDE_CODE_SESSION_ID, "
+        "LOOPD_SESSION_ID, CLAUDE_SESSION_ID is set in the lead's environment, "
+        "and no transcript under ~/.claude/projects matched the current working "
+        "directory. The β Stop hook requires the real Claude Code session UUID "
+        "to match dev_session_id; using a placeholder would silently break "
+        "dev-done auto-resume."
+    )
 
 
 def mark_dev_started(state: Dict[str, Any], session_id: str) -> None:

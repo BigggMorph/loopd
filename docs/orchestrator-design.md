@@ -2921,7 +2921,7 @@ case ("dev_running", "fresh"):
 | `read_last_task_result(transcript_path)` | path | str or None | transcript JSONL의 마지막 Task 도구 결과 body 추출. orch-stop hook의 Gate 3 (review approve 시그니처 검증)용. 없으면 None (Gate 3는 보강 신호이므로 graceful fallback) (Round 3 R3-13) |
 | `parse_teammate_sender(msg)` | message dict | str or None | PoC-1 결과로 결정. 첫 구현은 body prefix `[<name>]:` 매칭 |
 | `parse_json_tail(text)` | str | dict or None | 마지막 라인 JSON 파싱. 실패 시 None |
-| `current_session_id()` | — | str | Claude Code 환경에서 session_id 획득. 우선순위 `CLAUDE_CODE_SESSION_ID`(canonical — orch_stop payload.session_id와 동일) → `LOOPD_SESSION_ID` → `CLAUDE_SESSION_ID`(legacy fallback). **셋 다 없으면 RuntimeError raise (placeholder UUID 금지)** — placeholder는 β hook Gate 1 매칭을 영구히 깨므로. lead는 ready_for_dev에서 except 시 issue를 needs_human으로 park. |
+| `current_session_id()` | — | str | Claude Code 환경에서 session_id 획득. 우선순위 `CLAUDE_CODE_SESSION_ID`(canonical — orch_stop payload.session_id와 동일) → `LOOPD_SESSION_ID` → `CLAUDE_SESSION_ID`(legacy fallback). **env var 셋 다 없으면**(Claude Code 2.1.116 등에서 관측) `~/.claude/projects/*/*.jsonl` transcript fallback: 최근 `_TRANSCRIPT_FRESHNESS_S`(300s) 내 flush + 최신 이벤트 `cwd`가 현재 cwd와 일치하는 transcript가 **정확히 1개일 때만** 그 `sessionId`(= 파일명 stem = payload.session_id) 반환 — live 세션을 명확히 식별한 경우. **0개(live transcript 미flush)·2개+(동시 same-cwd 윈도우)는 ambiguous → None → RuntimeError raise** (잘못된 real-UUID도 placeholder처럼 Gate 1을 조용히 깨므로 추측 금지). lead는 ready_for_dev에서 except 시 issue를 needs_human으로 park (loud·복구 가능). |
 
 ### Issue / PR
 | 함수 | 입력 | 출력 | 실패 시 |
