@@ -406,14 +406,17 @@ Then:
 ```python
 # Source of truth: CLAUDE_CODE_SESSION_ID (canonical; falls back to
 # LOOPD_SESSION_ID / CLAUDE_SESSION_ID) env var injected by the Claude Code
-# harness. NEVER make up a placeholder UUID — the β Stop hook Gate 1 compares
-# this against the live payload.session_id (== CLAUDE_CODE_SESSION_ID);
-# a mismatch silently breaks dev-done auto-resume forever.
+# harness. When the harness injects none of them (seen on Claude Code 2.1.116),
+# current_session_id() recovers the real UUID from the live transcript on disk.
+# NEVER make up a placeholder UUID — the β Stop hook Gate 1 compares this
+# against the live payload.session_id (== CLAUDE_CODE_SESSION_ID); a mismatch
+# silently breaks dev-done auto-resume forever.
 try:
     session_id = orchestrator_state.current_session_id()
 except RuntimeError as exc:
-    # Env var missing — refuse to start dev. Park the issue so the user
-    # can investigate; do NOT proceed with a synthetic id.
+    # Neither env var nor transcript yielded a session id — refuse to start
+    # dev. Park the issue so the user can investigate; do NOT proceed with a
+    # synthetic id.
     issue.failure_reason = f"current_session_id unavailable: {exc}"
     transition(issue, "needs_human")
     write(state)
