@@ -211,6 +211,63 @@ def find_path_intersections(
     return [n for n in conflicts if n]
 
 
+# (substring, canonical pattern, suggested resolution). Single source of truth
+# for both detect_lesson_pattern (mutating counter) and canonical_for_reason
+# (pure lookup, used by the system-doctor stall classifier — Feature 1).
+_LESSON_PATTERNS: List[Tuple[str, str, str]] = [
+    (
+        "loopd session 미생성",
+        "/dev-task 시작 후 loopd session 파일 미생성",
+        "PYTHONPATH/CLAUDE_PLUGIN_ROOT 점검, loopd 플러그인 활성화 확인",
+    ),
+    (
+        "tester 20분 무응답",
+        "tester 무응답",
+        "tester teammate 재spawn 또는 SendMessage 재시도 빈도 점검",
+    ),
+    (
+        "analyzer 10분 무응답",
+        "analyzer 무응답",
+        "analyzer teammate 재spawn 또는 prompt 단순화",
+    ),
+    (
+        "pr url 추출 실패",
+        "PR URL 추출 실패",
+        "loopd dev-task의 branch naming + transcript 패턴 점검",
+    ),
+    (
+        "dev rework 2회",
+        "tester가 PR 2회 연속 거부",
+        "criteria 명확화, dev_task_prompt 보강, 사용자 컨텍스트 추가",
+    ),
+    (
+        "gh pr merge 실패",
+        "auto-merge 실패",
+        "branch protection / required checks / required reviews 확인",
+    ),
+    (
+        "split sub-issue 0건",
+        "split 결과 0개",
+        "analyzer가 force_split 시 atomic 판정 — 사용자 확인 필요",
+    ),
+]
+
+
+def canonical_for_reason(failure_reason: str) -> Optional[Tuple[str, str]]:
+    """Pure map of a failure_reason → (canonical_pattern, resolution), or None.
+
+    No mutation — used by `detect_lesson_pattern` and by the system-doctor
+    stall classifier (which must NOT bump observed_count).
+    """
+    if not failure_reason or not isinstance(failure_reason, str):
+        return None
+    text = failure_reason.lower()
+    for needle, canonical, fix in _LESSON_PATTERNS:
+        if needle in text:
+            return canonical, fix
+    return None
+
+
 def detect_lesson_pattern(
     failure_reason: str, state: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
@@ -220,56 +277,10 @@ def detect_lesson_pattern(
     cluster arbitrary text — we just count occurrences of known reasons
     so the analyzer/tester prompts can be informed about repeat issues.
     """
-    if not failure_reason or not isinstance(failure_reason, str):
+    match = canonical_for_reason(failure_reason)
+    if match is None:
         return None
-    text = failure_reason.lower()
-    patterns: List[Tuple[str, str, str]] = [
-        # (substring, canonical pattern, suggested resolution)
-        (
-            "loopd session 미생성",
-            "/dev-task 시작 후 loopd session 파일 미생성",
-            "PYTHONPATH/CLAUDE_PLUGIN_ROOT 점검, loopd 플러그인 활성화 확인",
-        ),
-        (
-            "tester 20분 무응답",
-            "tester 무응답",
-            "tester teammate 재spawn 또는 SendMessage 재시도 빈도 점검",
-        ),
-        (
-            "analyzer 10분 무응답",
-            "analyzer 무응답",
-            "analyzer teammate 재spawn 또는 prompt 단순화",
-        ),
-        (
-            "pr url 추출 실패",
-            "PR URL 추출 실패",
-            "loopd dev-task의 branch naming + transcript 패턴 점검",
-        ),
-        (
-            "dev rework 2회",
-            "tester가 PR 2회 연속 거부",
-            "criteria 명확화, dev_task_prompt 보강, 사용자 컨텍스트 추가",
-        ),
-        (
-            "gh pr merge 실패",
-            "auto-merge 실패",
-            "branch protection / required checks / required reviews 확인",
-        ),
-        (
-            "split sub-issue 0건",
-            "split 결과 0개",
-            "analyzer가 force_split 시 atomic 판정 — 사용자 확인 필요",
-        ),
-    ]
-    matched_canonical: Optional[str] = None
-    resolution: Optional[str] = None
-    for needle, canonical, fix in patterns:
-        if needle in text:
-            matched_canonical = canonical
-            resolution = fix
-            break
-    if matched_canonical is None:
-        return None
+    matched_canonical, resolution = match
     lessons = state.setdefault("lessons_learned", [])
     for entry in lessons:
         if entry.get("pattern") == matched_canonical:
@@ -951,6 +962,35 @@ def clear_scout_fields(state: Dict[str, Any]) -> None:
                 state[field] = None
 
 
+DOCTOR_FIELDS_TO_CLEAR = (
+    "doctor_started_at",
+    "doctor_retried",
+    "doctor_message",
+    "last_doctor_signature",
+)
+
+
+def clear_doctor_fields(state: Dict[str, Any]) -> None:
+    """Reset transient system-doctor fields between cycles.
+
+    Keeps the durable history/audit (`doctor_history`, `doctor_signatures_seen`,
+    `doctor_issues_today`) so runaway guards and the daily cap survive.
+    """
+    for field in DOCTOR_FIELDS_TO_CLEAR:
+        if field in state:
+            v = state[field]
+            if isinstance(v, list):
+                state[field] = []
+            elif isinstance(v, dict):
+                state[field] = {}
+            elif isinstance(v, bool):
+                state[field] = False
+            elif isinstance(v, int):
+                state[field] = 0
+            else:
+                state[field] = None
+
+
 __all__ = [
     "SPLIT_EPIC_MARKER",
     "parse_json_tail",
@@ -959,12 +999,14 @@ __all__ = [
     "parse_selected_candidate_ids",
     "find_path_intersections",
     "detect_lesson_pattern",
+    "canonical_for_reason",
     "compose_daily_digest",
     "mark_as_epic_body",
     "clear_scout_fields",
     "dedup_candidates",
     "candidate_create_plan",
     "clear_planner_fields",
+    "clear_doctor_fields",
     "DEDUP_METHOD_DEFAULT",
     # Phase 17-D — vision-critic helpers
     "vision_delta_violates_guard",

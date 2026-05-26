@@ -47,5 +47,17 @@ Both `loopd` and `orchestrator` plugins must be enabled.
 > /orchestrator split:1234      # force-split a too-large issue
 > /orchestrator resume:1234     # resume parked issue
 > /orchestrator force:1234      # override analyzer reject
+> /orchestrator lang:ko         # set user-facing output language (ko|en, default ko)
+> /orchestrator reset:true      # back up + reinitialize this repo's state
 > /orchestrator stop:true       # graceful shutdown
 ```
+
+### Parallel repos
+
+Each repo gets its own state under `~/.loopd/orchestrator/<repo-slug>/state.json`
+and its own team (`orchestrator-<repo-slug>`), so you can run one
+`/orchestrator` per repo concurrently in separate sessions without their work
+colliding. Pass `repo:owner/name` on the first call of each session; the
+session is then bound (via `instances.json`) so later no-arg calls resolve the
+right instance. A pre-existing single-repo `state.json` is migrated into its
+per-repo directory automatically on first bind.

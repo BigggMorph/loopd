@@ -17,22 +17,238 @@ import errno
 import fcntl
 import json
 import os
+import re
 import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 SCHEMA_VERSION = 3
 ORCHESTRATOR_DIR = Path(os.path.expanduser("~/.loopd/orchestrator"))
-STATE_PATH = ORCHESTRATOR_DIR / "state.json"
-LOCK_PATH = ORCHESTRATOR_DIR / "state.lock"
-AUDIT_ARCHIVE_DIR = ORCHESTRATOR_DIR / "audit_archive"
-SENTINEL_DEV_DONE = ORCHESTRATOR_DIR / "dev_done_pending.flag"
+
+# Feature 3 — per-repo parallel instances. State files live under
+# ORCHESTRATOR_DIR/<repo-slug>/ so multiple orchestrators (one per repo) run
+# without colliding on a single state.json. An empty slug ("") is the legacy
+# *flat* layout (ORCHESTRATOR_DIR/state.json) used when no repo is bound yet,
+# which keeps single-repo users and the whole pre-Feature-3 test suite working.
+#
+# The path "constants" STATE_PATH / LOCK_PATH / SENTINEL_DEV_DONE /
+# AUDIT_ARCHIVE_DIR are now resolved dynamically per active instance via the
+# module-level __getattr__ (PEP 562) at the bottom of this file, so existing
+# `orchestrator_state.STATE_PATH` accesses keep working but follow the active
+# instance. New code should call state_path()/lock_path()/... directly.
+INSTANCES_PATH = ORCHESTRATOR_DIR / "instances.json"
+INSTANCES_LOCK = ORCHESTRATOR_DIR / "instances.lock"
+
 # Where Claude Code writes per-session transcripts (~/.claude/projects/<slug>/
 # <session-uuid>.jsonl). Used only as a fallback by current_session_id() when
 # the harness fails to inject a session env var (issue #14).
 CLAUDE_PROJECTS_DIR = Path(os.path.expanduser("~/.claude/projects"))
+
+# Process-scoped active instance. None = auto-resolve (env → instances.json →
+# flat); "" = explicit flat; "<slug>" = explicit instance. Reset on module
+# reload (tests reload the module per the conftest autouse fixture).
+_ACTIVE_INSTANCE: Optional[str] = None
+# Cache for the auto-resolve session→slug lookup (only consulted when
+# _ACTIVE_INSTANCE is None). Cleared by set/clear_active_instance.
+_SLUG_MEMO: Optional[str] = None
+
+_SLUG_UNSAFE_RX = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def repo_to_slug(repo: Optional[str]) -> str:
+    """Map a repo ("owner/repo") to a filesystem-safe slug ("owner-repo").
+
+    Idempotent on already-slugified strings. The lead derives the team_name
+    ("orchestrator-<slug>") from the same function so the team dir and the
+    state dir always agree.
+    """
+    s = (repo or "").strip()
+    s = _SLUG_UNSAFE_RX.sub("-", s)
+    return s.strip("-._")
+
+
+def set_active_instance(slug_or_repo: Optional[str]) -> None:
+    """Pin the active instance for this process (overrides auto-resolution).
+
+    Accepts either a slug or an "owner/repo" (slugified). Empty/None → explicit
+    flat layout. Used by the lead after a `repo:` arg, by the orch_stop hook
+    after it identifies the owning instance, and by tests.
+    """
+    global _ACTIVE_INSTANCE, _SLUG_MEMO
+    _ACTIVE_INSTANCE = repo_to_slug(slug_or_repo) if slug_or_repo else ""
+    _SLUG_MEMO = None
+
+
+def clear_active_instance() -> None:
+    """Return to auto-resolution (None). Mainly for tests / the hook."""
+    global _ACTIVE_INSTANCE, _SLUG_MEMO
+    _ACTIVE_INSTANCE = None
+    _SLUG_MEMO = None
+
+
+def _safe_session_id() -> Optional[str]:
+    try:
+        return current_session_id()
+    except Exception:  # noqa: BLE001 — resolution is best-effort here
+        return None
+
+
+def _resolve_active_slug() -> str:
+    """Resolve the active instance slug.
+
+    Priority: explicit `set_active_instance` → `ORCHESTRATOR_INSTANCE` env →
+    persisted session→slug binding (instances.json) → "" (flat).
+    """
+    global _SLUG_MEMO
+    if _ACTIVE_INSTANCE is not None:
+        return _ACTIVE_INSTANCE
+    if _SLUG_MEMO is not None:
+        return _SLUG_MEMO
+    slug = ""
+    env = os.environ.get("ORCHESTRATOR_INSTANCE")
+    if env:
+        slug = repo_to_slug(env)
+    else:
+        sid = _safe_session_id()
+        if sid:
+            bound = resolve_instance_for_session(sid)
+            if bound:
+                slug = bound
+    _SLUG_MEMO = slug
+    return slug
+
+
+def active_instance_slug() -> str:
+    """Public accessor for the resolved active slug ("" == flat)."""
+    return _resolve_active_slug()
+
+
+def active_instance_dir() -> Path:
+    slug = _resolve_active_slug()
+    return ORCHESTRATOR_DIR / slug if slug else ORCHESTRATOR_DIR
+
+
+def state_path() -> Path:
+    return active_instance_dir() / "state.json"
+
+
+def lock_path() -> Path:
+    return active_instance_dir() / "state.lock"
+
+
+def sentinel_dev_done() -> Path:
+    return active_instance_dir() / "dev_done_pending.flag"
+
+
+def audit_archive_dir() -> Path:
+    return active_instance_dir() / "audit_archive"
+
+
+# --- session ↔ instance binding (instances.json, own lock) ----------------
+
+def _read_instances() -> Dict[str, str]:
+    if not INSTANCES_PATH.exists():
+        return {}
+    try:
+        data = json.loads(INSTANCES_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(v, str)} if isinstance(data, dict) else {}
+
+
+def resolve_instance_for_session(session_id: Optional[str]) -> Optional[str]:
+    """Look up the slug a session was bound to (or None)."""
+    if not session_id:
+        return None
+    return _read_instances().get(session_id)
+
+
+def bind_session_to_instance(session_id: Optional[str], slug_or_repo: str) -> str:
+    """Persist session_id → slug in instances.json (own flock) and pin it for
+    this process. Returns the slug. The lead calls this once per `repo:` arg so
+    later no-arg calls in the same session resolve the right instance.
+    """
+    _ensure_base_dir()
+    slug = repo_to_slug(slug_or_repo)
+    lock_fd = os.open(str(INSTANCES_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        data = _read_instances()
+        if session_id:
+            data[session_id] = slug
+        _atomic_write(INSTANCES_PATH, json.dumps(data, indent=2, sort_keys=True))
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+    set_active_instance(slug)
+    return slug
+
+
+def iter_instance_slugs() -> List[str]:
+    """List slugs that currently have a state.json (flat "" included)."""
+    slugs: List[str] = []
+    if (ORCHESTRATOR_DIR / "state.json").exists():
+        slugs.append("")
+    if ORCHESTRATOR_DIR.is_dir():
+        for child in sorted(ORCHESTRATOR_DIR.iterdir()):
+            if child.is_dir() and (child / "state.json").exists():
+                slugs.append(child.name)
+    return slugs
+
+
+def find_instance_by_dev_session(session_id: str) -> Optional[str]:
+    """Return the slug of the instance whose state.dev_session_id == session_id.
+
+    Used by the β Stop hook, which gets only a session_id in its payload and
+    must locate the owning instance among all per-repo state files. Session
+    UUIDs are globally unique, so at most one instance matches. Returns None
+    when no instance owns the session (e.g. a non-orchestrator Stop event).
+    """
+    if not session_id:
+        return None
+    for slug in iter_instance_slugs():
+        sp = (ORCHESTRATOR_DIR / "state.json") if slug == "" else (ORCHESTRATOR_DIR / slug / "state.json")
+        try:
+            st = json.loads(sp.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(st, dict) and st.get("dev_session_id") == session_id:
+            return slug
+    return None
+
+
+def _maybe_migrate_flat(slug: str) -> None:
+    """One-time move of the legacy flat state.json into a per-repo dir.
+
+    Only fires when bound to a non-empty slug, the per-instance file is absent,
+    and the flat file's `repo` slugifies to this slug (so a flat file belonging
+    to a different repo is left untouched for its owner).
+    """
+    if not slug:
+        return
+    per = ORCHESTRATOR_DIR / slug / "state.json"
+    if per.exists():
+        return
+    flat = ORCHESTRATOR_DIR / "state.json"
+    if not flat.exists():
+        return
+    try:
+        st = json.loads(flat.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(st, dict) or repo_to_slug(st.get("repo") or "") != slug:
+        return
+    (ORCHESTRATOR_DIR / slug).mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(ORCHESTRATOR_DIR / slug, 0o700)
+    os.replace(str(flat), str(per))
+    flat_lock = ORCHESTRATOR_DIR / "state.lock"
+    if flat_lock.exists():
+        with contextlib.suppress(OSError):
+            flat_lock.unlink()
 
 _ACTIVE_STATUSES = {
     "new",
@@ -101,6 +317,17 @@ _VISION_CHECK_STATUSES = {
     "vision_check_parked",
 }
 
+# Feature 1 — system-doctor (self-healing) cycle statuses. Lives on
+# state.doctor_status; same separate-enum pattern as the planning/roadmap/
+# vision cycles.
+_DOCTOR_STATUSES = {
+    "doctor_pending",    # awaiting system-doctor diagnosis reply
+    "doctor_received",   # diagnosis received + validated
+    "doctor_filing",     # filing the fix issue on GitHub
+    "doctor_done",       # cycle complete
+    "doctor_parked",     # parked (low confidence / runaway cap / loosen-safety)
+}
+
 
 def now() -> _dt.datetime:
     return _dt.datetime.now(_dt.timezone.utc)
@@ -114,13 +341,20 @@ def _iso(dt: Optional[_dt.datetime]) -> Optional[str]:
     return dt.isoformat()
 
 
-def _ensure_dirs() -> None:
+def _ensure_base_dir() -> None:
     ORCHESTRATOR_DIR.mkdir(parents=True, exist_ok=True)
     # chmod 700 — sensitive (vision text, audit log).
-    try:
+    with contextlib.suppress(OSError):
         os.chmod(ORCHESTRATOR_DIR, 0o700)
-    except OSError:
-        pass
+
+
+def _ensure_dirs() -> None:
+    _ensure_base_dir()
+    inst = active_instance_dir()
+    if inst != ORCHESTRATOR_DIR:
+        inst.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            os.chmod(inst, 0o700)
 
 
 def _empty_state() -> Dict[str, Any]:
@@ -132,6 +366,10 @@ def _empty_state() -> Dict[str, Any]:
         "repo": "",
         "team_name": "",
         "mode": "resolution",
+        # User-facing response language for all lead output (digests, notices,
+        # AskUserQuestion text/options, summaries). "ko" | "en". Set via the
+        # `/orchestrator lang:ko|en` arg. Backfills to "ko" for existing states.
+        "response_language": "ko",
         "current_issue": None,
         "dev_session_id": None,
         "dev_done_injected": False,
@@ -216,6 +454,24 @@ def _empty_state() -> Dict[str, Any]:
         "pending_team_spawns": [],
         "teammate_health": {},
         "pending_respawn": {},
+        # === Feature 1 (self-healing) ===
+        # Periodic-trigger bookkeeping (Part 0 — Rev 16 §14A).
+        "last_invocation_at": None,
+        "resumed_after_gap_log": [],
+        # system-doctor cycle.
+        "doctor_status": None,                 # _DOCTOR_STATUSES enum | None
+        "doctor_started_at": None,
+        "doctor_retried": False,
+        "doctor_history": [],                  # FIFO 50 / TTL 90d
+        "doctor_history_log": [],              # transition trail
+        "doctor_message": None,                # stashed diagnosis reply
+        "last_doctor_signature": None,         # signature currently being diagnosed
+        "doctor_signatures_seen": {},          # {sig:{count,first_at,last_at,fix_issue_url}}
+        "doctor_issues_today": [],             # iso timestamps of filed fixes (daily cap)
+        # Auto-resume guard (transient stalls — Part 1).
+        "last_resume_signature": None,
+        "last_resume_at": None,
+        "resume_attempts": {},                 # {sig:{count,first_at,last_at}}
     }
 
 
@@ -254,14 +510,16 @@ def read() -> Dict[str, Any]:
     is mid-rename (very small window, but cheap to be safe).
     """
     _ensure_dirs()
-    if not STATE_PATH.exists():
+    _maybe_migrate_flat(_resolve_active_slug())
+    sp = state_path()
+    if not sp.exists():
         return _empty_state()
     # Shared lock for read.
-    lock_fd = os.open(str(LOCK_PATH), os.O_RDWR | os.O_CREAT, 0o600)
+    lock_fd = os.open(str(lock_path()), os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_SH)
         try:
-            raw = STATE_PATH.read_text()
+            raw = sp.read_text()
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
     finally:
@@ -284,11 +542,11 @@ def _normalize(state: Dict[str, Any]) -> Dict[str, Any]:
 
 def write(state: Dict[str, Any]) -> None:
     _ensure_dirs()
-    lock_fd = os.open(str(LOCK_PATH), os.O_RDWR | os.O_CREAT, 0o600)
+    lock_fd = os.open(str(lock_path()), os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         try:
-            _atomic_write(STATE_PATH, _serialize(state))
+            _atomic_write(state_path(), _serialize(state))
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
     finally:
@@ -303,7 +561,8 @@ def flock_session(timeout_s: float = 30.0) -> Iterator[Dict[str, Any]]:
     changes; otherwise edits are discarded.
     """
     _ensure_dirs()
-    lock_fd = os.open(str(LOCK_PATH), os.O_RDWR | os.O_CREAT, 0o600)
+    _maybe_migrate_flat(_resolve_active_slug())
+    lock_fd = os.open(str(lock_path()), os.O_RDWR | os.O_CREAT, 0o600)
     deadline = time.monotonic() + timeout_s
     acquired = False
     last_err: Optional[OSError] = None
@@ -323,8 +582,9 @@ def flock_session(timeout_s: float = 30.0) -> Iterator[Dict[str, Any]]:
                 f"flock_session: could not acquire lock within {timeout_s}s "
                 f"(last error: {last_err})"
             )
-        if STATE_PATH.exists():
-            state = json.loads(STATE_PATH.read_text())
+        sp = state_path()
+        if sp.exists():
+            state = json.loads(sp.read_text())
             state = _normalize(state)
         else:
             state = _empty_state()
@@ -348,7 +608,7 @@ def write_in_lock(state: Dict[str, Any]) -> None:
     """
     if not state.pop("__in_lock__", False):
         raise RuntimeError("write_in_lock called outside flock_session()")
-    _atomic_write(STATE_PATH, _serialize(state))
+    _atomic_write(state_path(), _serialize(state))
     state["__in_lock__"] = True  # restore so caller can keep mutating
 
 
@@ -427,6 +687,19 @@ def vision_transition(state: Dict[str, Any], new_status: Optional[str]) -> None:
         {"at": _iso(now()), "from": old, "to": new_status}
     )
     state["vision_check_status"] = new_status
+
+
+def doctor_transition(state: Dict[str, Any], new_status: Optional[str]) -> None:
+    """Record a system-doctor-cycle status transition. `None` returns to idle."""
+    if new_status is not None and new_status not in _DOCTOR_STATUSES:
+        raise ValueError(f"unknown doctor status: {new_status}")
+    old = state.get("doctor_status")
+    if old == new_status:
+        return
+    state.setdefault("doctor_history_log", []).append(
+        {"at": _iso(now()), "from": old, "to": new_status}
+    )
+    state["doctor_status"] = new_status
 
 
 # Fallback recency window (seconds): only transcripts whose file was flushed
@@ -619,6 +892,10 @@ _FIFO_CAPS: Dict[str, int] = {
     "planner_history": 50,
     "roadmap_reports": 10,
     "feedback_log": 100,
+    # Feature 1 — system-doctor.
+    "doctor_history": 50,
+    "doctor_history_log": 200,
+    "resumed_after_gap_log": 100,
 }
 
 # (field, ttl_days) — TTL prune from §12.2.
@@ -629,6 +906,7 @@ _TTL_DAYS: Dict[str, int] = {
     "roadmap_reports": 90,
     "feedback_log": 60,
     "rejected_delta_hashes": 30,
+    "doctor_history": 90,
 }
 
 # Single-slot fields that must never be touched by the pruner (Round A S7).
@@ -700,30 +978,94 @@ def prune_state_history(state: Dict[str, Any]) -> Dict[str, int]:
 
 
 def state_file_size_bytes() -> int:
-    """Return current STATE_PATH size in bytes (0 if missing)."""
-    if not STATE_PATH.exists():
+    """Return current state.json size in bytes for the active instance (0 if missing)."""
+    sp = state_path()
+    if not sp.exists():
         return 0
     try:
-        return STATE_PATH.stat().st_size
+        return sp.stat().st_size
     except OSError:
         return 0
 
 
 def reset_to_empty() -> None:
-    """Test helper — delete state.json so the next read() yields a fresh state."""
-    if STATE_PATH.exists():
-        STATE_PATH.unlink()
-    if LOCK_PATH.exists():
+    """Test helper — delete the active instance's state.json so the next read()
+    yields a fresh state."""
+    sp = state_path()
+    lp = lock_path()
+    if sp.exists():
+        sp.unlink()
+    if lp.exists():
         with contextlib.suppress(FileNotFoundError):
-            LOCK_PATH.unlink()
+            lp.unlink()
+
+
+def reset_instance(
+    keep_fields: Tuple[str, ...] = ("vision", "repo", "response_language", "team_name"),
+) -> Optional[str]:
+    """Back up the active instance's state.json, then reinitialize it in place,
+    preserving `keep_fields` (Feature 3 `reset:true`).
+
+    GitHub PRs/issues are left untouched — this clears local FSM state only.
+    Returns the backup file path (str) or None if there was nothing to back up.
+    """
+    with flock_session() as state:
+        backup_path: Optional[Path] = None
+        sp = state_path()
+        if sp.exists():
+            backup_dir = active_instance_dir() / "state_backup"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            with contextlib.suppress(OSError):
+                os.chmod(backup_dir, 0o700)
+            stamp = now().strftime("%Y%m%dT%H%M%SZ")
+            backup_path = backup_dir / f"{stamp}.json"
+            _atomic_write(
+                backup_path,
+                json.dumps(state, indent=2, sort_keys=True, default=_iso),
+            )
+        preserved = {k: state.get(k) for k in keep_fields if state.get(k) not in (None, "")}
+        fresh = _empty_state()
+        fresh.update(preserved)
+        in_lock = state.pop("__in_lock__", False)
+        state.clear()
+        state.update(fresh)
+        if in_lock:
+            state["__in_lock__"] = True
+        write_in_lock(state)
+        return str(backup_path) if backup_path else None
+
+
+_DYNAMIC_PATHS = {
+    "STATE_PATH": state_path,
+    "LOCK_PATH": lock_path,
+    "SENTINEL_DEV_DONE": sentinel_dev_done,
+    "AUDIT_ARCHIVE_DIR": audit_archive_dir,
+}
+
+
+def __getattr__(name: str) -> Any:  # PEP 562
+    """Resolve the legacy path "constants" dynamically per active instance.
+
+    Keeps `orchestrator_state.STATE_PATH` (etc.) working for existing callers
+    and the test suite while following the active per-repo instance. New code
+    should call state_path()/lock_path()/sentinel_dev_done()/audit_archive_dir()
+    directly.
+    """
+    resolver = _DYNAMIC_PATHS.get(name)
+    if resolver is not None:
+        return resolver()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [
     "SCHEMA_VERSION",
     "ORCHESTRATOR_DIR",
+    "INSTANCES_PATH",
+    "CLAUDE_PROJECTS_DIR",
     "STATE_PATH",
     "LOCK_PATH",
     "SENTINEL_DEV_DONE",
+    "AUDIT_ARCHIVE_DIR",
     "now",
     "read",
     "write",
@@ -734,13 +1076,29 @@ __all__ = [
     "planning_transition",
     "roadmap_transition",
     "vision_transition",
+    "doctor_transition",
     "mark_dev_started",
     "mark_dev_done_injected",
     "update_issue",
     "get_issue",
     "reset_to_empty",
+    "reset_instance",
     "prune_state_history",
     "state_file_size_bytes",
     "STATE_SIZE_WARN_BYTES",
     "STATE_SIZE_HARD_BYTES",
+    # Feature 3 — per-repo instances.
+    "repo_to_slug",
+    "set_active_instance",
+    "clear_active_instance",
+    "active_instance_slug",
+    "active_instance_dir",
+    "state_path",
+    "lock_path",
+    "sentinel_dev_done",
+    "audit_archive_dir",
+    "bind_session_to_instance",
+    "resolve_instance_for_session",
+    "iter_instance_slugs",
+    "find_instance_by_dev_session",
 ]

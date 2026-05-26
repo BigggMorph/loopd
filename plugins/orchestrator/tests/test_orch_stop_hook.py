@@ -118,3 +118,38 @@ def test_hook_noop_when_dev_session_id_is_none(isolated_home, tmp_path):
     transcript.write_text("")
     proc = _run_hook("any", transcript, isolated_home)
     assert proc.stdout.strip() == ""
+
+
+def _seed_dev_running_for(slug: str, session_id: str, current_issue: int = 42) -> None:
+    """Seed a dev_running state under a specific per-repo instance."""
+    orchestrator_state.set_active_instance(slug)
+    try:
+        _seed_dev_running(session_id, current_issue)
+    finally:
+        orchestrator_state.clear_active_instance()
+
+
+def test_hook_scans_instances_and_blocks_only_the_owner(isolated_home, tmp_path):
+    # Feature 3 — two parallel repos, each mid-dev in its own session.
+    _seed_dev_running_for("a/x", "sess-A", current_issue=11)
+    _seed_dev_running_for("b/y", "sess-B", current_issue=22)
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text("")
+
+    # Stop event for session A → only instance a-x should be injected.
+    proc = _run_hook("sess-A", transcript, isolated_home)
+    assert json.loads(proc.stdout)["decision"] == "block"
+
+    orchestrator_state.set_active_instance("a/x")
+    assert orchestrator_state.read()["dev_done_injected"] is True
+    orchestrator_state.set_active_instance("b/y")
+    assert orchestrator_state.read()["dev_done_injected"] is False
+    orchestrator_state.clear_active_instance()
+
+
+def test_hook_noop_when_no_instance_owns_session(isolated_home, tmp_path):
+    _seed_dev_running_for("a/x", "sess-A")
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text("")
+    proc = _run_hook("unrelated-session", transcript, isolated_home)
+    assert proc.stdout.strip() == ""

@@ -32,6 +32,13 @@ do not skip):
 6. **Every mutating gh command goes through `audited_bash`**
    (`gh issue create|close|edit|reopen`, `gh pr merge|create|close|edit`).
    Read-only `gh issue view`, `gh pr list`, etc. use plain `bash`.
+7. **Write all user-facing output in `state.response_language`** (`"ko"` by
+   default, set via `lang:ko|en`). This covers every digest, notice, warning,
+   summary, and the question text + option labels of every AskUserQuestion.
+   When you surface a teammate's human-readable fields (`summary`, `rationale`,
+   `analysis`, `reject_reason`, `critical_questions`), restate them in that
+   language. The internal `ORCH_INJECT:dev_done` signal and machine-parsed JSON
+   are exempt — only human-readable text is localized.
 
 ## Helper modules you use
 
@@ -43,8 +50,9 @@ Bash with `python3 -c`):
 | `orchestrator_state` | `read()`, `write()`, `flock_session()`, `write_in_lock()`, `transition(issue, status)`, `current_session_id()`, `mark_dev_started()`, `get_issue()`, `now()` |
 | `wake_inference` | `infer(transcript_path, state) → (reason, sender)`, `read_last_user_message()`, `read_last_task_result()` |
 | `issue_picker` | `pick(state) → [≤5 issues]`, `resume_waiting_on_dep(state)`, `remember_pick()` |
-| `lifecycle` | `ensure_labels(repo)`, `ensure_split_label(repo, parent_num)`, `team_alive(team_name)`, `LABEL_SPEC` |
-| `safety` | `has_dangerous_label()`, `would_self_modify()`, `sanitize_scout_body()`, `parse_acceptance_criteria()`, `sanitize_feedback_message()`, `fingerprint_label()`, `push_pending_question()` |
+| `lifecycle` | `ensure_labels(repo)`, `ensure_split_label(repo, parent_num)`, `team_alive(team_name)`, `ensure_team_member()`, `LABEL_SPEC` |
+| `safety` | `has_dangerous_label()`, `would_self_modify()`, `would_loosen_safety()`, `sanitize_scout_body()`, `parse_acceptance_criteria()`, `sanitize_feedback_message()`, `fingerprint_label()`, `push_pending_question()` |
+| `doctor` | `classify_stall(state, wake_reason) → (verdict, payload)`, `restore_parked_issue()`, `failure_signature()`, auto-resume + runaway guards (Feature 1 self-healing) |
 
 Set `PYTHONPATH` for these quick calls:
 
@@ -58,6 +66,48 @@ the fallback path is for testing/dev.
 ---
 
 ## The lead loop — what you do on every invocation
+
+### Step −6: Self-stall detection + auto-resume (Feature 1)
+
+**Skip this step entirely if the invocation carried any argument** (the user is
+issuing an explicit command — honor it at Step 0 instead). Otherwise, on a
+continuation/timer wake, detect whether the orchestrator is *alive-but-stuck*
+and recover. Compute the wake reason early (reused by Step 4):
+
+```python
+wake_reason = wake_inference.infer(transcript_path, state)   # cheap, tail scan
+with flock_session() as state:
+    verdict, p = doctor.classify_stall(state, wake_reason)
+```
+
+- `("none", _)` → continue to Step −5.
+- `("human", _)` → a genuine wait for the user; **do not auto-touch**. Continue
+  (the normal dispatch / existing AskUser surfaces it).
+- `("transient", p)` → auto-resume, recording it so the user can see/undo:
+  - `doctor.record_resume_attempt(state, p["signature"])` and
+    `audit.record_state_mutation(state, actor="system-doctor",
+    action="auto-resume", payload={k: p[k] for k in ("action","num","signature")})`.
+  - `p["action"] == "restore_parked"`: `doctor.restore_parked_issue(state,
+    p["num"])`; `write()`; emit a one-line notice (in `response_language`,
+    e.g. "자동 재개: #<num>") and **continue to Step 5** (the restored status
+    drives a fresh dispatch — which ends the turn on its SendMessage).
+  - `p["action"] == "process_dev_done"`: `transition(issue, "dev_done")`;
+    `write()`; **continue to Step 6A** `("dev_done", _)` (re-enter PR
+    extraction + tester — do NOT re-run `/dev-task`).
+- `("structural", p)` → hand to the system-doctor cycle, guarded:
+  - `doctor.prune_doctor_issues_today(state)`; if
+    `doctor.doctor_daily_cap_reached(state)` → emit notice ("system-doctor 일일
+    상한 도달 — 오늘은 추가 진단 보류"), leave the issue as-is, `write()`, continue.
+  - If `doctor.doctor_signature_active(state, p["failure_signature"])` → a fix
+    is already in flight for this signature; emit a brief notice, continue.
+  - Else stash the diagnosis request and enter the cycle:
+    `state["doctor_message"] = p`; `state["last_doctor_signature"] =
+    p["failure_signature"]`; `state["doctor_started_at"] = now()`;
+    `doctor_transition(state, "doctor_pending")`; `write()`; **go to Step 6E**.
+
+Only one recovery action per invocation; after acting, follow its “continue”
+target. This step is what makes a stuck loop self-heal once it is re-invoked
+(via `/loop` or the CronCreate routine — see Step 0 notes).
 
 ### Step −5: Watch-list expiry (Rev 13 A2)
 
@@ -168,6 +218,28 @@ first matching member). `write()`. Continue if no respawn was needed.
   - `write()`, emit summary, return.
 - `vision:"…"` / `repo:…` → set on state, append prior vision to
   `vision_history`. Doesn't disrupt in-flight issue.
+  - **When `repo:` is given (Feature 3 parallel instances):** before loading
+    state, bind this session to the repo's instance so every later no-arg call
+    in this session resolves the right per-repo `state.json`:
+    ```bash
+    python3 -c "import orchestrator_state as s; \
+      s.bind_session_to_instance(s.current_session_id(), '${repo}')"
+    ```
+    If `current_session_id()` raises (no session id resolvable), still call
+    `s.set_active_instance('${repo}')` for this process and proceed — the bind
+    just won't persist across calls until a session id is available. State for
+    different repos lives at `~/.loopd/orchestrator/<repo-slug>/state.json` and
+    never collides. The slug is `orchestrator_state.repo_to_slug(repo)`.
+- `lang:ko` / `lang:en` → set `state.response_language` (validate ∈ {"ko","en"};
+  ignore otherwise). Emit a one-line confirmation in the new language, `write()`.
+  Does not end the turn — continue.
+- `reset:true` → back up + reinitialize THIS instance's state (keeps
+  `vision`/`repo`/`response_language`; GitHub PRs/issues untouched):
+  ```bash
+  python3 -c "import orchestrator_state as s; print(s.reset_instance() or '(nothing to back up)')"
+  ```
+  Emit the backup path to the user (in `response_language`) and return. Run any
+  `repo:` binding above first so the right instance is reset.
 - `scout:true` → if `current_issue.status == "dev_running"`, transition
   it to parked first; set `mode="scouting"`, `scout_status="scout_new"`,
   `scout_started_at=now()`.
@@ -183,15 +255,24 @@ first matching member). `write()`. Continue if no respawn was needed.
 - `force:N` → set `issue.force_process = True`, transition to `new` (or
   pick #N if not in state). The next analyzer call will include
   `FORCE_PROCESS=true`.
-- `resume:N` → require status == `parked_awaiting_human`. Restore the
-  most recent active status from `issue.history` (fallback `new`); reset
-  all `*_started_at` and `*_retried` flags; set `state.current_issue = N`.
-  If another issue is currently active, park it first.
+- `resume:N` → require status == `parked_awaiting_human`. Call
+  `doctor.restore_parked_issue(state, N)` (the shared helper — restores the
+  most recent active status from `issue.history`, fallback `new`, and resets the
+  `*_started_at`/`*_retried`/`*_emitted` flags). If another issue is currently
+  active, park it first.
 - `split:N` → see §9 `split:N` in the design (similar to resume but
   forces `issue.force_split = True`, status `new`). Guard against
   `is_split_epic == True` (refuse double-split).
 - `scout_bootstrap_done:true` → `state.scout_bootstrap_done = True`,
   emit confirmation, return.
+- `doctor:true` → force a self-stall re-diagnosis: clear
+  `state.last_doctor_signature` and re-run Step −6's `doctor.classify_stall`
+  on the current state (bypassing the "skip if args present" guard for this
+  arg only). If it yields `structural`, enter the doctor cycle.
+- `doctor:N` → force-diagnose issue #N: set `current_issue=N`, build a stall
+  payload from its `failure_reason`/`status`, set `doctor_message`,
+  `last_doctor_signature = doctor.failure_signature(reason, status)`,
+  `doctor_transition("doctor_pending")`, `write()`, go to Step 6E.
 
 ### Step 1: Load state
 
@@ -199,6 +280,26 @@ first matching member). `write()`. Continue if no respawn was needed.
 STATE=$(python3 -c "import orchestrator_state, json; \
   print(json.dumps(orchestrator_state.read()))")
 ```
+
+`read()` auto-resolves the active per-repo instance (explicit `repo:` bind →
+`ORCHESTRATOR_INSTANCE` env → session→slug binding in
+`~/.loopd/orchestrator/instances.json` → flat legacy layout), so no extra
+plumbing is needed once a session has been bound (Step 0 `repo:`). Parallel
+`/orchestrator` sessions on different repos each read their own `state.json`.
+
+**Invocation bookkeeping (Feature 1 Part 0):** after loading, compute the gap
+since the last wake and record this one:
+```python
+prev = state.get("last_invocation_at")
+gap_h = (now() - parse(prev)).total_seconds()/3600 if prev else 0
+if gap_h >= 24:
+    state.setdefault("resumed_after_gap_log", []).append({"at": now_iso(), "gap_hours": round(gap_h,1)})
+    # surface to the user (response_language): "Nh 만에 재개됨".
+state["last_invocation_at"] = now_iso()
+```
+A large gap is informational only — the FSM's idempotency guards
+(`last_verdict_signature`, `merge_question_emitted`, `scout-fp-*`) already absorb
+redundant wakes, so no special reconciliation is needed.
 
 ### Step 2: First-run init
 
@@ -209,7 +310,9 @@ vision text and (if needed) the repo. Save to state and return.
 
 If `state.team_name` is empty or `lifecycle.team_alive(team_name) == False`:
 
-- TeamCreate with `team_name = "orchestrator-<repo-slug>"`.
+- TeamCreate with `team_name = "orchestrator-" + orchestrator_state.repo_to_slug(repo)`
+  (the same slug as the state dir, so the team and state always agree and
+  parallel repos get distinct teams).
 - Agent(subagent_type="issue-analyzer", name="issue-analyzer", …).
 - Agent(subagent_type="tester", name="tester", …).
 - Agent(subagent_type="issue-scout", name="issue-scout", …).
@@ -248,6 +351,12 @@ And whenever a `teammate_reply` wake handler parses a reply (Step 6A /
 (`sent_tokens=0`). This is what feeds `lifecycle.needs_respawn` in
 Step −0 — without these calls the watermark cannot fire.
 
+**Language tag (Rev 18):** prepend a `LANG=<state.response_language>` line
+(e.g. `LANG=ko`) to **every** outgoing teammate SendMessage body, alongside
+any `PHASE_CONTEXT:` block. Teammates use it to write their human-readable
+fields (summary/rationale/analysis/…) in the requested language so the lead
+can surface them without translating.
+
 ### Step 4: Infer wake reason
 
 ```python
@@ -272,6 +381,10 @@ If conclusion == failure → set `state.main_branch_red = True`, emit a
 warning. The picker will boost main-fix candidates by +200.
 
 ### Step 5: Mode decision
+
+If `state.doctor_status` is set → go to **Step 6E** (system-doctor dispatch).
+A detected self-bug is diagnosed first; the cycle returns to idle
+(`doctor_done`/`doctor_parked` → None) so normal dispatch resumes next.
 
 If `state.mode == "scouting"` → go to **Step 6B** (Stage 1: scout + planner).
 
@@ -970,6 +1083,84 @@ with flock_session() as state:
 `vision_critic_pending_delta.proposed_at > 24h ago`, commit it to
 history with `user_action="parked_expired"` and clear the slot.
 
+### Step 6E: system-doctor dispatch (Feature 1)
+
+Entered when `state.doctor_status` is set (Step −6 set `doctor_pending` after a
+structural stall, or `doctor:true`/`doctor:N` forced it). Mirrors Step 6C/6D.
+Match on `(state.doctor_status, wake_reason)`:
+
+#### `("doctor_pending", _)` — first entry (no doctor reply yet)
+1. `lifecycle.ensure_team_member(team_name, "system-doctor", state)`. If it
+   returns False (`pending_team_spawns` appended) → `write()`; return (Step 3
+   spawns it next turn).
+2. Build the `DOCTOR_REQUEST:` body from `state.doctor_message` (the stall
+   payload) + the issue `history` + the matching `lessons_learned` entry +
+   the last ~10 `audit_log` entries. Prepend `LANG=<response_language>`.
+3. `lifecycle.record_teammate_call(state, "system-doctor", sent_tokens=len(body)//4)`.
+4. SendMessage(to="system-doctor", body). Set `doctor_started_at=now()`,
+   `doctor_retried=False`. `write()`. Return.
+
+#### `("doctor_pending", ("teammate_reply","system-doctor"))`
+`parsed = parse_json_tail(...)`. None → ask resend (max 2), return.
+- `status == "insufficient_evidence"` → emit notice ("system-doctor: 원인
+  미특정 — {note}"); `doctor_transition(None)`; `clear_doctor_fields`; return.
+- **loopd-untouchable guard:** if not `doctor.targets_are_safe(parsed.target_files)`
+  (every entry must be under `plugins/orchestrator/`, none under `plugins/loopd/`,
+  and the list non-empty) → drop the whole diagnosis, emit a loud notice, record
+  `doctor_history` with `user_action="dropped_target_escape"`,
+  `doctor_transition("doctor_parked")`, push a pending question, return.
+- **loosen-safety guard:** if `safety.would_loosen_safety({"title": parsed.root_cause,
+  "body": parsed.fix_issue_body})` → drop, record `user_action="blocked_loosen_safety"`,
+  `doctor_transition("doctor_parked")`, loud notice, return.
+- **confidence:** if `parsed.confidence < 0.5` → do NOT file. Record the
+  diagnosis in `doctor_history` with `user_action="low_confidence"`,
+  `doctor_transition("doctor_parked")`, push a pending question summarizing the
+  hypothesis for the user, return.
+- Else stash `issue.doctor_diagnosis = parsed`, update the receiver token
+  estimate, `doctor_transition("doctor_received")`, **fall through**.
+
+#### `("doctor_received", _)` — runaway gate, then file
+- `doctor.prune_doctor_issues_today(state)`. If `doctor.doctor_daily_cap_reached`
+  → record skip, `doctor_transition("doctor_parked")`, notice, return.
+- If `doctor.doctor_signature_active(state, last_doctor_signature)` OR a GitHub
+  search finds an OPEN `doctor-fp-<sig>` issue → suppress (fix already in
+  flight): record, `doctor_transition("doctor_done")`, fall through to cleanup.
+- Else `doctor_transition("doctor_filing")`, **fall through**.
+
+#### `("doctor_filing", _)` — create the fix issue
+- `plan = playbook_helpers.candidate_create_plan({"id": sig, "title":
+  parsed.root_cause-derived, "body": parsed.fix_issue_body, "labels":
+  ["self-modify","infrastructure","orchestrator-managed"]}, fp_prefix="doctor-fp-",
+  extra_labels=["self-modify","infrastructure","orchestrator-managed"])`.
+  The body gets `<!-- doctor-fix-for: <sig> -->` appended.
+- Pre-check `gh issue list --label <plan.fingerprint_label> --state all` — if it
+  exists, reuse the URL (idempotent). Else `audited_bash gh label create
+  <plan.fingerprint_label>` then `audited_bash gh issue create … --label
+  <,>.join(plan.labels)`.
+- `doctor.record_doctor_signature(state, sig, fix_issue_url=url)`;
+  `state.doctor_issues_today.append(now())`; append a `doctor_history` entry
+  `{ts, root_cause, severity, fix_issue_url, user_action:"filed"}`.
+- `doctor_transition("doctor_done")`, fall through.
+
+#### `("doctor_done"|"doctor_parked", _)`
+`playbook_helpers.clear_doctor_fields(state)`; `doctor_transition(None)`;
+`write()`. Emit a notice (in `response_language`): "system-doctor가 self-stall
+<sig>에 대해 fix 이슈 <url>를 등록했습니다. 이 이슈는 일반 analyze→dev→test 사이클을
+거치며, **머지 전 반드시 사용자 확인**을 받습니다 (would_self_modify 강제)." Goto Step 5.
+
+#### `("doctor_pending", _)` — other wake (timeout)
+10-min timeout. First hit → re-request via SendMessage (`doctor_retried=True`).
+Second hit → `doctor_transition(None)` + `clear_doctor_fields` + notice
+("system-doctor 무응답 — 이번 사이클 건너뜀"). Identical to roadmap/vision timeout.
+
+> **Self-modify is intentional, not a bug.** The fix issue carries `self-modify`
+> + `infrastructure`, so `safety.would_self_modify` returns True deterministically:
+> the picker AskUser-confirms it before dev starts and the verdict funnels
+> through `merge_pending` — it can never auto-merge. The doctor never edits
+> code; the fix lands on `main` via the normal pipeline and takes effect on the
+> NEXT fresh `/orchestrator` (helpers reload per call; SKILL.md is re-read each
+> invocation) — no hot-swap of the running process.
+
 ---
 
 ## pick_best_by_vision(candidates, vision)
@@ -1049,6 +1240,33 @@ Stage 1 merges scout + planner pools via
 
 Drop entries from `merged.drops` are surfaced to the user before the
 multiSelect ("scout c2 auto-deduped against planner p1 (sim 0.93)").
+
+## Keeping the loop alive (Feature 1 Part 0 — periodic trigger)
+
+Self-stall detection (Step −6) and auto-resume only fire when the playbook is
+**re-invoked**. An alive-but-stuck loop cannot wake itself, so something must
+re-enter `/orchestrator` periodically:
+
+1. **`/loop` (preferred):** `/loop 5m /orchestrator` re-runs the playbook every
+   5 minutes. Each tick is a `("fresh", None)` wake, so Step −6 runs and either
+   advances the FSM, auto-resumes a transient stall, or dispatches the doctor.
+2. **CronCreate routine (robust fallback, Rev 16 §14A):** when `/loop` is
+   unreliable (e.g. its timer dies when a usage window ends), register a
+   schedule that calls `/orchestrator` on a cron (e.g. every 5–10 min). A fire
+   that lands in an exhausted usage window simply fails and the next slot
+   retries — no work is lost because all state is on disk and the FSM is
+   idempotent. Use the `schedule` skill / CronCreate to set this up once.
+
+If `/loop` "doesn't advance," check: (a) a `/dev-task` is multi-turn and owns
+the window until the β Stop hook fires — a timer tick during dev is absorbed;
+(b) confirm both `loopd` and `orchestrator` plugins are enabled and
+`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`; (c) a 24h+ gap is logged in
+`resumed_after_gap_log` (Step 1) — large gaps are normal after a pause and the
+next tick resumes cleanly.
+
+This is **not** an external OS watchdog: if the whole Claude Code process dies,
+nothing here revives it (out of scope by design). It keeps an *alive* loop
+moving and self-healing.
 
 ## When in doubt
 

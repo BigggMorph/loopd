@@ -19,7 +19,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 REQUIRED_TEAMMATES = ("issue-analyzer", "tester", "issue-scout")
 # Rev 17 — planning-layer teammates are spawned lazily on first use.
-OPTIONAL_TEAMMATES = ("product-planner", "roadmap-strategist", "vision-critic")
+# Feature 1 — system-doctor is also lazy-spawned (only when a structural stall
+# is detected).
+OPTIONAL_TEAMMATES = (
+    "product-planner",
+    "roadmap-strategist",
+    "vision-critic",
+    "system-doctor",
+)
 ALL_TEAMMATES = REQUIRED_TEAMMATES + OPTIONAL_TEAMMATES
 TEAMS_DIR = Path(os.path.expanduser("~/.claude/teams"))
 TASKS_DIR = Path(os.path.expanduser("~/.claude/tasks"))
@@ -36,6 +43,7 @@ WATERMARK_CALLS: Dict[str, int] = {
     "product-planner": 10,
     "roadmap-strategist": 5,
     "vision-critic": 3,
+    "system-doctor": 3,
 }
 
 WATERMARK_TOKENS: Dict[str, int] = {
@@ -45,6 +53,7 @@ WATERMARK_TOKENS: Dict[str, int] = {
     "product-planner": 100_000,
     "roadmap-strategist": 100_000,
     "vision-critic": 150_000,
+    "system-doctor": 200_000,
 }
 
 # Minimum interval between forced respawns for one teammate (rate-limit,
@@ -77,6 +86,11 @@ LABEL_SPEC: List[Dict[str, str]] = [
     {"name": "planner-suggested", "color": "9F47CC", "description": "orchestrator product-planner가 도출한 Epic"},
     {"name": "roadmap-context", "color": "F5C518", "description": "roadmap-strategist phase context 추적용 (선택)"},
     {"name": "vision-update-pending", "color": "B30000", "description": "vision-critic 갱신 제안 사용자 confirm 대기"},
+    # Feature 1 — system-doctor self-fix labels. These make would_self_modify
+    # fire deterministically (they are in safety.SELF_MODIFY_LABELS), so every
+    # doctor-filed fix routes through human-confirm merge.
+    {"name": "self-modify", "color": "B60205", "description": "orchestrator 자기 코드 수정 (사람 confirm 강제)"},
+    {"name": "infrastructure", "color": "5319E7", "description": "orchestrator 인프라/플레이북 변경 (사람 confirm 강제)"},
 ]
 
 
@@ -274,6 +288,11 @@ def _summarize_entries(entries: List[Dict[str, Any]], max_entries: int = 3) -> s
                 f"{ts}: phase={entry.get('current_phase')}, "
                 f"user_action={entry.get('user_action')}"
             )
+        elif "root_cause" in entry or "fix_issue_url" in entry:
+            parts.append(
+                f"{ts}: doctor sev={entry.get('severity')} "
+                f"fix={entry.get('fix_issue_url') or '(none)'}"
+            )
         else:
             parts.append(f"{ts}: {entry.get('pattern') or '...'}")
     return "; ".join(parts) if parts else "(no recent activity)"
@@ -341,6 +360,11 @@ def recover_team_context(state: Dict[str, Any], member: str) -> str:
         parts.append(
             "Recent vision-critic outcomes: "
             + _summarize_entries(state.get("vision_critic_history") or [])
+        )
+    elif member == "system-doctor":
+        parts.append(
+            "Recent system-doctor diagnoses: "
+            + _summarize_entries(state.get("doctor_history") or [])
         )
 
     return "\n".join(parts)

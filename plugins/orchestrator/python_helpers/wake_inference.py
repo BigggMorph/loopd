@@ -32,6 +32,8 @@ TEAMMATE_NAMES = (
     "product-planner",
     "roadmap-strategist",
     "vision-critic",
+    # Feature 1 self-healing.
+    "system-doctor",
 )
 
 # Maps the `phase` field of a teammate's JSON-tail reply to its sender slug.
@@ -48,6 +50,7 @@ PHASE_TO_SENDER: Dict[str, str] = {
     "plan": "product-planner",
     "roadmap": "roadmap-strategist",
     "vision_check": "vision-critic",
+    "doctor": "system-doctor",
 }
 
 WakeReason = Tuple[str, Optional[str]]

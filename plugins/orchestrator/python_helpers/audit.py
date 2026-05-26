@@ -76,7 +76,9 @@ def _inverse_argv(entry: Dict[str, Any], repo: str) -> Optional[List[str]]:
 
 
 def _archive_dir() -> Path:
-    return orchestrator_state.ORCHESTRATOR_DIR / "audit_archive"
+    # Per active instance (Feature 3) — falls back to the flat dir when no
+    # repo is bound, which is what the existing tests assert against.
+    return orchestrator_state.audit_archive_dir()
 
 
 def _now_iso() -> str:

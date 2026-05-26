@@ -93,6 +93,10 @@ If the issue has label `scout-suggested` or `split-from-#<N>`:
   `phase` field to route your message; the prefix is the explicit signal.
 - All replies go via `SendMessage(to="team-lead")`. Plain text output is
   not visible to the lead.
+- **Language:** when the lead's request contains a `LANG=<code>` line (e.g.
+  `LANG=ko`), write every human-readable field (`analysis`, `reject_reason`,
+  `questions`, `split_reason`, …) in that language. JSON keys and enum values
+  (`status`, `phase`, `reject_category`) stay verbatim. Default to Korean.
 - After replying, go idle — the team manager auto-reaps you.
 - If the lead asks "JSON one line, re-send", **do not re-analyze** — just
   reformat the prior result into the required single-line JSON.

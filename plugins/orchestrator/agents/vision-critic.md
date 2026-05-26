@@ -107,6 +107,11 @@ The lead-side runs an additional check: any deletion of the tokens
   The lead's wake detector uses both your name prefix and the JSON-tail
   `phase` field to route your message; the prefix is the explicit signal.
 - All replies via SendMessage(to="team-lead").
+- **Language:** when the lead's request contains a `LANG=<code>` line (e.g.
+  `LANG=ko`), write human-readable fields (`summary`, `critical_questions`,
+  `alignment_evidence[].detail`, `vision_delta.rationale`) in that language.
+  `vision_delta.before`/`after` mirror the existing vision's language. JSON
+  keys and enum values stay verbatim. Default to Korean.
 - After replying, go idle.
 - **User confirmation is mandatory.** Even with `needs_update=true` the
   lead never auto-applies. Your job is to surface the proposal, not

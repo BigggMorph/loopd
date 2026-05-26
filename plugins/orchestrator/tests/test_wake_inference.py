@@ -195,6 +195,45 @@ def test_infer_detects_vision_critic_sender(tmp_path):
     assert reason == ("teammate_reply", "vision-critic")
 
 
+def test_infer_detects_system_doctor_sender(tmp_path):
+    p = tmp_path / "transcript.jsonl"
+    _write_transcript(
+        p,
+        [
+            {
+                "role": "user",
+                "message": {
+                    "role": "user",
+                    "content": "[system-doctor]: root cause in wake_inference",
+                },
+            }
+        ],
+    )
+    reason = wake_inference.infer(str(p), {})
+    assert reason == ("teammate_reply", "system-doctor")
+
+
+def test_infer_detects_doctor_phase_json_tail(tmp_path):
+    p = tmp_path / "transcript.jsonl"
+    _write_transcript(
+        p,
+        [
+            {
+                "role": "user",
+                "message": {
+                    "role": "user",
+                    "content": '{"phase":"doctor","status":"complete","confidence":0.8}',
+                },
+            }
+        ],
+    )
+    assert wake_inference.infer(str(p), {}) == ("teammate_reply", "system-doctor")
+
+
+def test_phase_to_sender_has_doctor():
+    assert wake_inference.PHASE_TO_SENDER["doctor"] == "system-doctor"
+
+
 def test_infer_detects_sender_via_json_phase_without_any_prefix(tmp_path):
     """No [name]: prefix at all — the JSON-tail phase field must still
     let wake_inference classify the wake as ('teammate_reply', sender).

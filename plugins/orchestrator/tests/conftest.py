@@ -23,7 +23,14 @@ def isolated_home(tmp_path, monkeypatch):
     # The suite runs inside a real Claude Code session, so CLAUDE_CODE_SESSION_ID
     # is set in the ambient env. Clear all session vars so current_session_id()
     # tests are hermetic and only see what each test explicitly sets.
-    for _var in ("CLAUDE_CODE_SESSION_ID", "LOOPD_SESSION_ID", "CLAUDE_SESSION_ID"):
+    for _var in (
+        "CLAUDE_CODE_SESSION_ID",
+        "LOOPD_SESSION_ID",
+        "CLAUDE_SESSION_ID",
+        # Feature 3 — don't let an ambient instance binding leak into tests;
+        # each test starts unbound (flat layout) unless it sets one explicitly.
+        "ORCHESTRATOR_INSTANCE",
+    ):
         monkeypatch.delenv(_var, raising=False)
     # Modules cache absolute paths at import time → reload after HOME change.
     import orchestrator_state
