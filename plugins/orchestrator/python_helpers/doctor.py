@@ -247,7 +247,7 @@ def restore_parked_issue(state: Dict[str, Any], num: Any) -> bool:
         "merge_question_emitted",
         "human_qa_started_at",
         "conflict_warned",
-        "regression_q_emitted",
+        "regression_decision",
         "last_verdict_signature",
     ):
         issue.pop(k, None)
