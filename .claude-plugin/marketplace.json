@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "orchestrator",
-      "description": "Experimental autonomous GitHub issue resolution loop. Lead Claude thread + issue-analyzer / tester / issue-scout teammates auto-invoke loopd /dev-task. Requires the stable loopd plugin to be installed separately, plus CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1.",
+      "description": "Experimental autonomous GitHub issue resolution loop. Lead Claude thread + 7 teammates (issue-analyzer / tester / issue-scout / product-planner / roadmap-strategist / vision-critic / system-doctor) auto-invoke loopd /dev-task. Configurable response language, per-repo parallel instances, and self-healing stall recovery. Requires the stable loopd plugin to be installed separately, plus CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1.",
       "author": {
         "name": "BigggMorph",
         "email": "biggg.morph@gmail.com"

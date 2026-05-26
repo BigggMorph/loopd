@@ -134,11 +134,12 @@ def test_shutdown_marker_is_valid_json():
     assert parsed["team"] == "orch-x-y"
 
 
-def test_optional_teammates_are_three():
+def test_optional_teammates():
     assert set(lifecycle.OPTIONAL_TEAMMATES) == {
         "product-planner",
         "roadmap-strategist",
         "vision-critic",
+        "system-doctor",
     }
 
 
@@ -147,6 +148,19 @@ def test_label_spec_includes_rev17_labels():
     assert "planner-suggested" in names
     assert "roadmap-context" in names
     assert "vision-update-pending" in names
+
+
+def test_label_spec_includes_self_modify_labels():
+    # Feature 1 — these must exist so `gh issue create --label self-modify`
+    # works and would_self_modify fires on doctor-filed fixes.
+    names = {l["name"] for l in lifecycle.LABEL_SPEC}
+    assert "self-modify" in names
+    assert "infrastructure" in names
+
+
+def test_system_doctor_agent_frontmatter_name_matches():
+    # ensure_team_member's S9 guard requires the frontmatter name to match.
+    assert lifecycle._agent_frontmatter_name("system-doctor") == "system-doctor"
 
 
 def test_discover_alive_teammates_empty_when_no_team(tmp_path, monkeypatch):
@@ -259,10 +273,11 @@ import datetime as _dt
 from unittest import mock
 
 
-def test_watermark_constants_cover_all_six_teammates():
+def test_watermark_constants_cover_all_teammates():
     expected = {
         "issue-analyzer", "tester", "issue-scout",
         "product-planner", "roadmap-strategist", "vision-critic",
+        "system-doctor",
     }
     assert set(lifecycle.WATERMARK_CALLS.keys()) == expected
     assert set(lifecycle.WATERMARK_TOKENS.keys()) == expected

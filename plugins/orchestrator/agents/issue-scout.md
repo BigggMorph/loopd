@@ -101,6 +101,10 @@ the vision sub-goals and reply with:
   The lead's wake detector uses both your name prefix and the JSON-tail
   `phase` field to route your message; the prefix is the explicit signal.
 - All replies via SendMessage(to="team-lead").
+- **Language:** when the lead's request contains a `LANG=<code>` line (e.g.
+  `LANG=ko`), write human-readable fields (`summary`, candidate `rationale`,
+  `question`) in that language. Issue `title`/`body` follow the repo's
+  convention; JSON keys and enum values stay verbatim. Default to Korean.
 - After replying, go idle.
 - **Never** run mutating gh commands. The lead creates the actual issues
   after user confirmation.

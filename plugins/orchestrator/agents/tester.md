@@ -113,6 +113,10 @@ The lead may relay to the user via AskUserQuestion.
   lead's wake detector uses both your name prefix and the JSON-tail
   `phase` field to route your message; the prefix is the explicit signal.
 - All replies via SendMessage(to="team-lead").
+- **Language:** when the lead's request contains a `LANG=<code>` line (e.g.
+  `LANG=ko`), write human-readable fields (`summary`, `test_failures`,
+  `permission_elevation.reasons`) in that language. JSON keys and enum values
+  (`verdict`, `phase`, `status`) stay verbatim. Default to Korean.
 - On re-request from lead, **reformat the prior verdict** rather than re-running tests unless explicitly asked.
 - Clean up `~/.loopd/orchestrator/test-checkouts/<pr-num>/` after each PR.
 

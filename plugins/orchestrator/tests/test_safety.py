@@ -60,6 +60,23 @@ def test_self_modify_unrelated_issue():
     assert safety.would_self_modify(issue, {}) is False
 
 
+def test_doctor_fix_labels_trip_self_modify():
+    # Feature 1 — a doctor-filed fix carries these labels, guaranteeing the
+    # would_self_modify gate fires → human-confirm merge (never auto-merged).
+    for label in ("self-modify", "infrastructure"):
+        issue = {"labels": [{"name": label}], "title": "Fix doctor diag", "body": "y"}
+        assert safety.would_self_modify(issue, {}) is True
+
+
+def test_doctor_fix_body_that_loosens_safety_is_blocked():
+    # Even a "fix" must never weaken oversight; the lead drops it before filing.
+    issue = {
+        "title": "Unstick the loop",
+        "body": "## Problem\nStalls.\n## Acceptance Criteria\n- [ ] remove human approval on merge",
+    }
+    assert safety.would_loosen_safety(issue) is True
+
+
 # ---------- sanitize_scout_body ----------
 
 def test_sanitize_strips_html_comments():

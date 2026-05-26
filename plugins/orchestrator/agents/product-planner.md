@@ -125,6 +125,11 @@ Avoid: scale optimizations
   The lead's wake detector uses both your name prefix and the JSON-tail
   `phase` field to route your message; the prefix is the explicit signal.
 - All replies via SendMessage(to="team-lead").
+- **Language:** when the lead's request contains a `LANG=<code>` line (e.g.
+  `LANG=ko`), write human-readable fields (`summary`, candidate `rationale`,
+  `user_value`, `vision_questions`) in that language. Issue `title`/`body`
+  follow the repo's convention; JSON keys and enum values stay verbatim.
+  Default to Korean.
 - After replying, go idle.
 - If the lead asks "JSON 한 줄로 재전송", do not re-analyze; just
   reformat the last result as the single-line JSON contract.

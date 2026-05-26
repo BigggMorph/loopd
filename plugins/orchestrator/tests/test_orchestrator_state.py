@@ -281,6 +281,21 @@ def test_normalize_backfills_rev17_planning_fields(isolated_home):
     assert state["vision_check_status"] is None
     assert state["vision_critic_history"] == []
     assert state["vision_critic_pending_delta"] is None
+
+
+def test_empty_state_default_response_language_is_ko(isolated_home):
+    """Feature 2: a fresh state defaults user-facing output to Korean."""
+    state = orchestrator_state.read()
+    assert state["response_language"] == "ko"
+
+
+def test_normalize_backfills_response_language(isolated_home):
+    """Feature 2: an existing state.json without the field gains ko."""
+    orchestrator_state.ORCHESTRATOR_DIR.mkdir(parents=True, exist_ok=True)
+    legacy = {"version": 3, "vision": "v", "repo": "x/y", "issues": {}}
+    orchestrator_state.STATE_PATH.write_text(json.dumps(legacy))
+    state = orchestrator_state.read()
+    assert state["response_language"] == "ko"
     assert state["rejected_delta_hashes"] == []
     assert state["last_vision_critic_cycle"] == 0
     # Lazy spawn / health defaults.
@@ -348,6 +363,56 @@ def test_vision_transition_rejects_unknown(isolated_home):
     state = orchestrator_state.read()
     with pytest.raises(ValueError):
         orchestrator_state.vision_transition(state, "vision_check_done_wrong")
+
+
+# --- Feature 1 — system-doctor cycle -------------------------------------
+
+def test_doctor_transition_records_history(isolated_home):
+    state = orchestrator_state.read()
+    orchestrator_state.doctor_transition(state, "doctor_pending")
+    orchestrator_state.doctor_transition(state, "doctor_received")
+    orchestrator_state.doctor_transition(state, "doctor_filing")
+    orchestrator_state.doctor_transition(state, "doctor_done")
+    orchestrator_state.doctor_transition(state, None)
+    assert state["doctor_status"] is None
+    assert [e["to"] for e in state["doctor_history_log"]] == [
+        "doctor_pending", "doctor_received", "doctor_filing", "doctor_done", None
+    ]
+
+
+def test_doctor_transition_rejects_unknown(isolated_home):
+    state = orchestrator_state.read()
+    with pytest.raises(ValueError):
+        orchestrator_state.doctor_transition(state, "doctor_explode")
+
+
+def test_doctor_transition_idempotent(isolated_home):
+    state = orchestrator_state.read()
+    orchestrator_state.doctor_transition(state, "doctor_pending")
+    orchestrator_state.doctor_transition(state, "doctor_pending")
+    assert len(state["doctor_history_log"]) == 1
+
+
+def test_normalize_backfills_doctor_fields(isolated_home):
+    orchestrator_state.ORCHESTRATOR_DIR.mkdir(parents=True, exist_ok=True)
+    legacy = {"version": 3, "vision": "v", "repo": "x/y", "issues": {}}
+    orchestrator_state.STATE_PATH.write_text(json.dumps(legacy))
+    state = orchestrator_state.read()
+    assert state["doctor_status"] is None
+    assert state["doctor_history"] == []
+    assert state["doctor_signatures_seen"] == {}
+    assert state["doctor_issues_today"] == []
+    assert state["resume_attempts"] == {}
+    assert state["last_invocation_at"] is None
+    assert state["resumed_after_gap_log"] == []
+
+
+def test_prune_caps_doctor_history(isolated_home):
+    state = orchestrator_state.read()
+    state["doctor_history"] = [{"ts": orchestrator_state.now().isoformat()} for _ in range(60)]
+    pruned = orchestrator_state.prune_state_history(state)
+    assert len(state["doctor_history"]) == 50
+    assert pruned.get("doctor_history") == 10
 
 
 def test_rev17_fields_roundtrip(isolated_home):

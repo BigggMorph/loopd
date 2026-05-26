@@ -113,8 +113,24 @@ def main() -> None:
         _exit_noop()
         return
 
+    # Feature 3 — the payload carries only a session_id, so locate which
+    # per-repo instance owns this dev session before touching any state. Session
+    # UUIDs are globally unique → at most one instance matches. None means this
+    # Stop event belongs to no orchestrator instance (e.g. plain chat) → noop.
+    try:
+        slug = orchestrator_state.find_instance_by_dev_session(session_id)
+    except Exception as exc:  # noqa: BLE001 — never block the harness
+        sys.stderr.write(f"orch_stop.py instance scan error: {exc}\n")
+        _exit_noop()
+        return
+    if slug is None:
+        _exit_noop()
+        return
+    orchestrator_state.set_active_instance(slug)
+
     # Use flock_session so the dev_done_injected flip is atomic vs. concurrent
-    # writes from the lead playbook.
+    # writes from the lead playbook. All path constants below now resolve to
+    # this instance (set_active_instance above).
     try:
         with orchestrator_state.flock_session(timeout_s=5.0) as state:
             reason = _should_inject(state, session_id, transcript_path)

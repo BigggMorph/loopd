@@ -103,6 +103,11 @@ The lead may inject this text into the next Stage 1 SendMessage as a
   The lead's wake detector uses both your name prefix and the JSON-tail
   `phase` field to route your message; the prefix is the explicit signal.
 - All replies via SendMessage(to="team-lead").
+- **Language:** when the lead's request contains a `LANG=<code>` line (e.g.
+  `LANG=ko`), write human-readable fields (`summary`, `critical_path`,
+  `phase_evidence`, `vision_alignment_concern`, `phase_context_for_next_cycles`)
+  in that language. JSON keys and enum values (`current_phase`, `status`) stay
+  verbatim. Default to Korean.
 - After replying, go idle.
 - **Never** create tasks or run mutating gh commands. You diagnose and
   recommend only.
