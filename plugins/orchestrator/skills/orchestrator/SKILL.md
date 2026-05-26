@@ -53,6 +53,7 @@ Bash with `python3 -c`):
 | `lifecycle` | `ensure_labels(repo)`, `ensure_split_label(repo, parent_num)`, `team_alive(team_name)`, `ensure_team_member()`, `LABEL_SPEC` |
 | `safety` | `has_dangerous_label()`, `would_self_modify()`, `would_loosen_safety()`, `sanitize_scout_body()`, `parse_acceptance_criteria()`, `sanitize_feedback_message()`, `fingerprint_label()`, `push_pending_question()` |
 | `doctor` | `classify_stall(state, wake_reason) → (verdict, payload)`, `restore_parked_issue()`, `failure_signature()`, auto-resume + runaway guards (Feature 1 self-healing) |
+| `playbook_helpers` | `compose_daily_digest()`, `detect_lesson_pattern()`, `dedup_candidates()`, `classify_ci_completion(pr_view, check_runs, combined_status)` (Rev 19 post-merge gate), `observe_cap_minutes()`, `observe_poll_minutes()` |
 
 Set `PYTHONPATH` for these quick calls:
 
@@ -109,12 +110,75 @@ Only one recovery action per invocation; after acting, follow its “continue”
 target. This step is what makes a stuck loop self-heal once it is re-invoked
 (via `/loop` or the CronCreate routine — see Step 0 notes).
 
-### Step −5: Watch-list expiry (Rev 13 A2)
+### Step −5: Post-merge observation sweep (Rev 19)
 
-For every entry in `state.watch_list` whose `expires_at` has passed AND
-whose issue is still in `merged_observing`, transition the issue to
-`done_final`, bump `completed_count`, and drop the entry.
-(This runs regardless of whether the issue is the current_issue.)
+This is the **only** place that advances `merged_observing` issues, and it
+runs every wake **regardless of `current_issue`** (observation is fully
+non-blocking — the merge path frees `current_issue` immediately, so the lead
+keeps picking new issues while merged PRs are observed here in the
+background). Never read or write `current_issue` in this step.
+
+For every entry `w` in `state.watch_list` whose issue is still
+`merged_observing` **or** `regression_detected` (drop orphans whose issue is
+gone or already in a terminal state — just don't re-append them):
+
+1. **`regression_detected` entries — apply the pending decision or wait.** If
+   `issue.regression_decision` is set (the user answered the queued question —
+   see Step −3), act on it independent of `current_issue`: `revert` → emit a
+   `git revert` guide + `audited_bash gh pr create … --head 'revert-{pr_branch}'
+   --base main`, transition `reverted`; `keep` → transition `done_final` **and
+   bump `completed_count`**; `manual` → `failure_reason="regression suspected —
+   user chose manual review"`, transition `needs_human`. Drop the entry,
+   `continue`. If no decision yet, keep the entry and `continue` (still waiting
+   for the user — don't re-probe). Steps 2–6 below apply only to
+   `merged_observing` entries.
+2. **Poll-interval guard.** If `w.last_checked_at` is set and `now() -
+   w.last_checked_at < ORCHESTRATOR_OBSERVE_POLL_MIN` (`observe_poll_minutes()`,
+   default 5), keep the entry untouched and `continue` (no `gh` call) so
+   frequent wakes don't hammer the API.
+3. **Resolve merge state.** `gh pr view {w.pr_url} --repo {repo} --json
+   state,mergeCommit,mergedAt,headRefName`. `issue.pr_branch` is not reliably
+   recorded, so cache `w.pr_branch = w.pr_branch or pr_view.headRefName` here and
+   use `w.pr_branch` for the revert probes. Only fetch CI when the PR is actually
+   merged:
+   - `state == "MERGED"` with a merge SHA → fetch `gh api
+     'repos/{owner}/{repo}/commits/{sha}/check-runs?per_page=100'` and
+     `… /commits/{sha}/status?per_page=100` (per_page guards commits with >30
+     checks), cache `w.merge_commit_sha = sha`.
+   - otherwise pass `None` for both CI payloads.
+   Classify with `playbook_helpers.classify_ci_completion(pr_view, check_runs,
+   combined_status)`. Set `w.last_checked_at = now()`.
+4. **Branch on the verdict:**
+   - `pending_merge` (auto-merge not landed yet) → keep entry, `continue`.
+   - `closed_unmerged` (PR closed without merging) → set
+     `issue.regression_evidence = {"reason":"pr_closed_unmerged"}`, route a user
+     decision (step 6), keep entry, `continue`.
+   - `failed`, **or** an external `Revert` PR exists for `w.pr_branch`, **or** a
+     new `bug` issue created after `w.merged_at` references a touched path (skip
+     this cross-ref probe when `touched_paths` is empty — `contains("")` would
+     match every bug) → set `issue.regression_evidence` (ci verdict +
+     reverted_externally + new_bugs + merge_commit_sha), route a user decision
+     (step 6), keep entry, `continue`. Run these two probes only after the PR is
+     confirmed merged (skip for `pending_merge` / `closed_unmerged`).
+   - `passed` → transition `done_final`, **bump `completed_count`**, drop entry.
+   - `no_checks` / `running` → keep waiting **until the safety cap**: if `now() -
+     w.merged_at >= ORCHESTRATOR_OBSERVE_CAP_MIN` (`observe_cap_minutes()`,
+     default 60) with no failure, transition `done_final`, bump
+     `completed_count`, drop entry; else keep entry.
+5. The CI/revert/cross-ref probes reuse the old Rev 13 A2 commands; the CI gate
+   now targets the **squash-merge commit on `main`** (not the PR head) so it
+   catches merge-skew that pre-merge PR checks cannot.
+6. **Routing a regression decision (non-blocking):** transition the issue to
+   `regression_detected` and `safety.push_pending_question(state, {question,
+   options:[revert/keep/manual], "target": f"regression:{w.pr_url}"})`. The
+   `target` dedups so the user is never asked twice. Do **not** touch
+   `current_issue`. The answer arrives via Step −3 and is applied in step 1 of
+   the next sweep.
+
+`completed_count` is bumped **only here** for the merge→`done_final` path
+(guarded by `status == merged_observing` before the transition, so re-running
+the sweep can never double-count). The `done` terminal case bumps it for the
+non-observed `done` path only.
 
 ### Step −4: Stale-PR audit (Rev 13 B3)
 
@@ -137,8 +201,15 @@ AskUserQuestion limit), call AskUserQuestion, apply the answers to
 state, drop those 4 from the queue, `write()`, and **return** (AskUser
 ends the turn).
 
-Critical branches (regression confirmation, dangerous merge) skip the
-queue and go through AskUserQuestion immediately.
+When applying answers, route by the question's `target`:
+- `stale_pr:<num>` → set `issue.audit_decision` on the matching issue.
+- `regression:<pr_url>` → set `issue.regression_decision`
+  (`revert`/`keep`/`manual`) on the issue whose `pr_url` matches; Step −5
+  acts on it next sweep (no `current_issue` involvement).
+
+Dangerous-merge confirmation skips the queue and goes through
+AskUserQuestion immediately. Regression confirmation is **not** immediate —
+it is queued here so observation stays non-blocking (Rev 19).
 
 ### Step −2: Vision reflection (Rev 13 D1)
 
@@ -618,10 +689,16 @@ longer). Reuse `tester_retried` and `test_pending_started_at`.
     if state != "MERGED":
       audited_bash gh pr merge <pr> --squash --auto
     state.auto_merge_consecutive_safe += 1
-    transition done  (then merged_observing path below if used)
     ```
-    On merge success append a 6h watch_list entry and transition
-    `merged_observing` (Rev 13 A2) instead of straight `done`.
+    On merge success append an observation watch_list entry, transition
+    `merged_observing`, **and immediately set `state.current_issue = None`**
+    (Rev 19) so the next wake picks a new issue while this PR is observed in
+    the background by Step −5. The entry shape:
+    ```
+    {pr_url, issue_num, pr_branch, touched_paths, merged_at=now(),
+     merge_commit_sha=None, last_checked_at=None,
+     expires_at=now()+observe_cap_minutes()}   # expires_at = safety cap, not a wait
+    ```
 - If `verdict == "fail"`:
   - `rework_count < 2`: bump rework_count; append failures to
     `dev_task_prompt`; reset `last_verdict_signature`, `tester_retried`,
@@ -635,8 +712,9 @@ longer). Reuse `tester_retried` and `test_pending_started_at`.
 - 24h timeout → park.
 - Wake `user_input` → read answer:
   - "yes": idempotent merge (state-check first); if merge succeeds and
-    risky factors absent, bump `auto_merge_consecutive_safe`; add a
-    watch_list entry; transition `merged_observing`.
+    risky factors absent, bump `auto_merge_consecutive_safe`; add an
+    observation watch_list entry (same shape as the auto-merge path above);
+    transition `merged_observing`; set `state.current_issue = None` (Rev 19).
   - "no": transition `skipped_by_human`.
 - First entry (no `merge_question_emitted`): AskUserQuestion with PR URL
   + verdict summary; set `merge_question_emitted=True`,
@@ -685,40 +763,25 @@ This issue is dormant — Step 5's `picker.resume_waiting_on_dep(state)`
 re-tests dependencies on every wake. Don't process it inline here; just
 `current_issue = None`, `write()`, goto Step 5.
 
-#### `("merged_observing", _)` (Rev 13 A2)
+#### `("merged_observing", _)` (Rev 19)
 
-Active monitoring of a merged PR for 6h. On every wake:
+Observation is handled **entirely** in Step −5 (the background sweep, which
+runs regardless of `current_issue`). If dispatch reaches this case,
+`current_issue` is stale-pinned to an observing issue — free it so the next
+wake picks a new issue. Do **not** observe here. `state.current_issue =
+None`, `write()`, goto Step 5. (Same pattern as `("waiting_on_dep", _)`.)
 
-1. Find the matching `state.watch_list` entry by `pr_url`. If missing,
-   transition `done_final` and continue.
-2. Run regression probes:
-   - **CI**: `gh pr checks {pr_url} --json conclusion --jq '.[].conclusion'`.
-     Any `"failure"` → `ci_red = True`.
-   - **External revert**: `gh pr list --repo {repo} --search 'in:title
-     "Revert" head:{issue.pr_branch}' --json number --jq 'length'`.
-     `> 0` → `reverted_externally = True`.
-   - **Cross-reference**: `gh issue list --repo {repo} --state open
-     --label bug --search 'created:>{watch.merged_at}' --json
-     title,body --jq '.[] | select(.body | contains("<first touched path>"))' | head -3`.
-     Any output → `regression_suspect = True`.
-3. If any probe is true: save evidence on `issue.regression_evidence`,
-   transition `regression_detected`, continue.
-4. Else if `now() >= watch.expires_at`: drop watch_list entry,
-   transition `done_final`, `current_issue=None`, `write()`, goto Step 5.
-5. Else: return (wait for next wake).
+#### `("regression_detected", _)` (Rev 19)
 
-#### `("regression_detected", _)` (Rev 13 A2)
+The user decision is collected **out of band** via the pending-questions queue
+(Step −5 pushes the question; Step −3 records the answer into
+`issue.regression_decision`; Step −5 then acts on it). So this case never
+asks inline and never pins `current_issue`:
 
-- If `wake_reason == ("user_input", None)` — apply the AskUser answer:
-  - **`revert`**: `audited_bash gh pr create --repo {repo} --title 'Revert: {issue.title}' --body 'Auto-revert by orchestrator: regression suspected on PR {pr_url}\n\nEvidence: {regression_evidence}' --head 'revert-{pr_branch}' --base main`. The actual `git revert <sha>` step needs a worktree — emit a guide to the user; transition `reverted`.
-  - **`keep`**: transition `done_final`.
-  - **`manual`**: transition `needs_human` with failure_reason "regression suspected — user chose manual review".
-  - Drop the watch_list entry; `current_issue=None`; `write()`; goto Step 5.
-- Else (first entry):
-  - If `regression_q_emitted` is already true, return (still waiting for answer).
-  - Else AskUserQuestion with three options
-    (revert/keep/manual) and a summary of `regression_evidence`.
-  - Set `regression_q_emitted=True`, return.
+- If `issue.regression_decision` is set, it will be applied by Step −5 on the
+  next sweep — nothing to do here.
+- This case is a free-current_issue fallback: if `state.current_issue ==
+  issue.number`, set `current_issue = None`. `write()`, goto Step 5.
 
 #### `("pr_audit_pending", _)` (Rev 13 B3)
 
@@ -742,8 +805,9 @@ Both are terminal; ensure `state.current_issue = None`, write, goto
 Step 5.
 
 #### `("done"|"needs_human"|"skipped_by_human"|"parked_awaiting_human", _)`
-Terminal. `current_issue=None`, `completed_count += 1` (for `done` only),
-write, goto Step 5.
+Terminal. `current_issue=None`, `completed_count += 1` (for `done` only —
+the merge→`merged_observing`→`done_final` path is counted in Step −5 instead,
+so this never double-counts an observed merge), write, goto Step 5.
 
 ### Step 6B: Stage 1 dispatch — scout + product-planner (parallel)
 

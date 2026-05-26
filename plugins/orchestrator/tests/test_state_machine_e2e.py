@@ -21,6 +21,7 @@ import audit
 import issue_picker
 import orchestrator_state
 import playbook_helpers as ph
+import safety
 
 
 def _new_state(repo: str = "x/y") -> dict:
@@ -30,6 +31,92 @@ def _new_state(repo: str = "x/y") -> dict:
     state["team_name"] = "orch-test"
     orchestrator_state.write(state)
     return state
+
+
+# --- Rev 19 post-merge observation: Python simulations of the prose playbook ---
+# These mirror the SKILL.md / design.md merge path + Step −5 sweep using the
+# real helpers (the gh calls are external, so the CI classification is supplied
+# directly — classify_ci_completion itself is unit-tested in
+# test_playbook_helpers.py).
+
+def _enter_observation(state: dict, issue: dict, *, merged_at=None) -> dict:
+    """Mirror the test_received auto-merge success path (Rev 19)."""
+    cap = ph.observe_cap_minutes()
+    merged = merged_at or orchestrator_state.now()
+    w = {
+        "pr_url": issue.get("pr_url") or f"https://github.com/x/y/pull/{issue['number']}",
+        "issue_num": issue["number"],
+        "pr_branch": issue.get("pr_branch") or f"loopd-task-{issue['number']}",
+        "touched_paths": issue.get("touched_paths") or [],
+        "merged_at": merged.isoformat(),
+        "merge_commit_sha": None,
+        "last_checked_at": None,
+        "expires_at": (merged + timedelta(minutes=cap)).isoformat(),
+    }
+    state["watch_list"].append(w)
+    orchestrator_state.transition(issue, "merged_observing")
+    state["current_issue"] = None
+    return w
+
+
+def _route_regression(state: dict, issue: dict, w: dict) -> None:
+    orchestrator_state.transition(issue, "regression_detected")
+    safety.push_pending_question(state, {
+        "question": f"#{issue['number']} regression suspected. revert/keep/manual?",
+        "options": [{"label": "revert"}, {"label": "keep"}, {"label": "manual"}],
+        "target": f"regression:{w['pr_url']}",
+    })
+
+
+def _run_sweep_entry(state, issue, w, *, cls="running", reverted=False, xref=False):
+    """Mirror Step −5's per-entry branch for one watch entry, in-place.
+
+    Drops or keeps the entry in state['watch_list'] exactly as the sweep would.
+    `cls` is the classify_ci_completion verdict the lead would compute.
+    """
+    def _keep():
+        if w not in state["watch_list"]:
+            state["watch_list"].append(w)
+
+    def _drop():
+        state["watch_list"] = [x for x in state["watch_list"] if x is not w]
+
+    # Process against a fresh list each call (sweep rebuilds survivors).
+    state["watch_list"] = [x for x in state["watch_list"] if x is not w]
+
+    status = issue.get("status")
+    if status not in ("merged_observing", "regression_detected"):
+        return  # orphan / terminal → pruned
+
+    # 0. regression_detected: apply the user decision, or keep waiting.
+    if status == "regression_detected":
+        decision = issue.get("regression_decision")
+        if decision == "revert":
+            orchestrator_state.transition(issue, "reverted"); return
+        if decision == "keep":
+            orchestrator_state.transition(issue, "done_final"); state["completed_count"] += 1; return
+        if decision == "manual":
+            issue["failure_reason"] = "regression suspected — user chose manual review"
+            orchestrator_state.transition(issue, "needs_human"); return
+        _keep(); return  # no decision yet → wait
+
+    # status == merged_observing → CI-completion gate.
+    if cls == "pending_merge":
+        _keep(); return
+    if cls == "closed_unmerged":
+        issue["regression_evidence"] = {"reason": "pr_closed_unmerged"}
+        _route_regression(state, issue, w); _keep(); return
+    if cls == "failed" or reverted or xref:
+        issue["regression_evidence"] = {"ci": cls, "reverted_externally": reverted}
+        _route_regression(state, issue, w); _keep(); return
+    if cls == "passed":
+        orchestrator_state.transition(issue, "done_final"); state["completed_count"] += 1; return
+    # no_checks / running → safety cap
+    cap = ph.observe_cap_minutes()
+    from datetime import datetime
+    if orchestrator_state.now() - datetime.fromisoformat(w["merged_at"]) >= timedelta(minutes=cap):
+        orchestrator_state.transition(issue, "done_final"); state["completed_count"] += 1; return
+    _keep()
 
 
 def test_happy_path_new_to_done(isolated_home):
@@ -104,21 +191,31 @@ def test_happy_path_new_to_done(isolated_home):
     issue["test_verdict"] = verdict
     orchestrator_state.transition(issue, "test_received")
 
-    # 8. Auto-merge gates: all clear.
+    # 8. Auto-merge gates: all clear → merge enters non-blocking observation
+    #    (Rev 19): merged_observing + current_issue freed immediately, NOT done.
     assert verdict["verdict"] == "pass"
     assert verdict.get("diff_lines", 10**9) <= 200
     assert not verdict.get("permission_elevation", {}).get("detected")
     assert state["auto_merge_consecutive_safe"] >= 3
-    orchestrator_state.transition(issue, "done")
-    state["completed_count"] += 1
-    state["current_issue"] = None
+    _enter_observation(state, issue)
+    orchestrator_state.write(state)
+
+    observing = orchestrator_state.read()
+    assert observing["issues"]["42"]["status"] == "merged_observing"
+    assert observing["current_issue"] is None          # freed → throughput unblocked
+    assert observing["completed_count"] == 0           # NOT counted yet
+    assert len(observing["watch_list"]) == 1
+
+    # 9. Background Step −5 sweep: merge-commit CI on main passes → done_final.
+    _run_sweep_entry(state, issue, state["watch_list"][0], cls="passed")
     orchestrator_state.write(state)
 
     final = orchestrator_state.read()
     final_issue = final["issues"]["42"]
-    assert final_issue["status"] == "done"
+    assert final_issue["status"] == "done_final"
     assert final["completed_count"] == 1
     assert final["current_issue"] is None
+    assert final["watch_list"] == []
 
     # Verify full history chain.
     statuses = [h["to"] for h in final_issue["history"]]
@@ -130,7 +227,8 @@ def test_happy_path_new_to_done(isolated_home):
         "dev_done",
         "test_pending",
         "test_received",
-        "done",
+        "merged_observing",
+        "done_final",
     ]
 
 
@@ -721,3 +819,145 @@ def test_planner_creating_resumes_after_partial_write(isolated_home):
         and c["id"] not in reloaded["planner_creating_done"]
     ]
     assert [c["id"] for c in pending] == ["p2"]
+
+
+# ---------- Rev 19: non-blocking post-merge observation ----------
+
+def _observing_state(num=42, merged_at=None):
+    state = _new_state()
+    issue = {
+        "number": num, "status": "test_received", "history": [],
+        "pr_url": f"https://github.com/x/y/pull/{num}",
+        "pr_branch": f"loopd-task-{num}", "touched_paths": ["src/auth.py"],
+    }
+    state["issues"][str(num)] = issue
+    state["current_issue"] = num
+    orchestrator_state.write(state)
+    w = _enter_observation(state, issue, merged_at=merged_at)
+    orchestrator_state.write(state)
+    return state, issue, w
+
+
+def test_merge_frees_current_issue_and_picks_next(isolated_home):
+    """Headline throughput test: merging issue A frees current_issue
+    immediately, and a new issue B can proceed while A is still observed."""
+    state, issue_a, w = _observing_state(num=42)
+    assert state["current_issue"] is None        # freed at merge
+    assert issue_a["status"] == "merged_observing"
+    assert state["completed_count"] == 0         # not counted while observing
+    assert len(state["watch_list"]) == 1
+
+    # Lead's next wake picks issue B while A is still in watch_list.
+    issue_b = {"number": 43, "status": "new", "history": []}
+    state["issues"]["43"] = issue_b
+    state["current_issue"] = 43
+    orchestrator_state.transition(issue_b, "analyze_pending")
+    orchestrator_state.write(state)
+
+    reloaded = orchestrator_state.read()
+    assert reloaded["current_issue"] == 43       # B is in flight
+    assert reloaded["issues"]["42"]["status"] == "merged_observing"  # A still observed
+    assert len(reloaded["watch_list"]) == 1
+
+
+def test_watch_entry_issue_num_resolves_only_via_get_issue(isolated_home):
+    """Guard: watch entry issue_num is an int but state['issues'] keys are str.
+    The sweep MUST resolve via get_issue (str-normalized), not state.issues.get."""
+    state, issue, w = _observing_state(num=42)
+    assert isinstance(w["issue_num"], int)
+    # Direct int lookup misses (this is the bug the sweep must avoid):
+    assert state["issues"].get(w["issue_num"]) is None
+    # get_issue normalizes int -> str and finds it:
+    assert orchestrator_state.get_issue(state, w["issue_num"]) is issue
+
+
+def test_observe_sweep_ci_passed_done_final_counts_once(isolated_home):
+    state, issue, w = _observing_state(num=42)
+    _run_sweep_entry(state, issue, w, cls="passed")
+    orchestrator_state.write(state)
+    assert issue["status"] == "done_final"
+    assert state["completed_count"] == 1
+    assert state["watch_list"] == []
+
+    # Re-running the sweep must NOT double-count (entry pruned, status guard).
+    _run_sweep_entry(state, issue, w, cls="passed")
+    orchestrator_state.write(state)
+    assert orchestrator_state.read()["completed_count"] == 1
+
+
+def test_observe_sweep_ci_failed_routes_pending_question(isolated_home):
+    state, issue, w = _observing_state(num=42)
+    _run_sweep_entry(state, issue, w, cls="failed")
+    orchestrator_state.write(state)
+    assert issue["status"] == "regression_detected"
+    assert state["current_issue"] is None            # never hijacked
+    assert len(state["watch_list"]) == 1             # entry kept until decision
+    targets = [q.get("target") for q in state["pending_questions"]]
+    assert f"regression:{w['pr_url']}" in targets
+    # Dedup: a second failed sweep must not enqueue a duplicate question.
+    _run_sweep_entry(state, issue, w, cls="failed")
+    assert sum(1 for t in targets if t == f"regression:{w['pr_url']}") == 1
+
+
+def test_observe_sweep_external_revert_routes_regression(isolated_home):
+    state, issue, w = _observing_state(num=42)
+    _run_sweep_entry(state, issue, w, cls="passed", reverted=True)
+    assert issue["status"] == "regression_detected"  # revert signal overrides pass
+
+
+def test_observe_sweep_no_checks_falls_to_safety_cap(isolated_home):
+    # Within the cap → keep waiting.
+    state, issue, w = _observing_state(num=42)
+    _run_sweep_entry(state, issue, w, cls="no_checks")
+    orchestrator_state.write(state)
+    assert issue["status"] == "merged_observing"
+    assert len(state["watch_list"]) == 1
+
+    # Backdate the same entry past the cap → done_final.
+    old = orchestrator_state.now() - timedelta(minutes=ph.observe_cap_minutes() + 5)
+    w["merged_at"] = old.isoformat()
+    _run_sweep_entry(state, issue, w, cls="no_checks")
+    orchestrator_state.write(state)
+    assert issue["status"] == "done_final"
+    assert state["completed_count"] == 1
+    assert state["watch_list"] == []
+
+
+def test_observe_sweep_running_respects_safety_cap(isolated_home):
+    old = orchestrator_state.now() - timedelta(minutes=ph.observe_cap_minutes() + 1)
+    state, issue, w = _observing_state(num=42, merged_at=old)
+    _run_sweep_entry(state, issue, w, cls="running")
+    assert issue["status"] == "done_final"           # cap reached, no failure → pass
+
+
+def test_observe_sweep_pending_merge_waits(isolated_home):
+    state, issue, w = _observing_state(num=42)
+    _run_sweep_entry(state, issue, w, cls="pending_merge")
+    orchestrator_state.write(state)
+    assert issue["status"] == "merged_observing"     # auto-merge not landed → wait
+    assert len(state["watch_list"]) == 1
+
+
+def test_observe_sweep_orphan_entry_pruned(isolated_home):
+    state, issue, w = _observing_state(num=42)
+    orchestrator_state.transition(issue, "done_final")   # already left observation
+    _run_sweep_entry(state, issue, w, cls="passed")
+    orchestrator_state.write(state)
+    assert state["watch_list"] == []                 # orphan dropped
+    assert state["completed_count"] == 0             # not re-counted
+
+
+@pytest.mark.parametrize("decision,expected,counts", [
+    ("keep", "done_final", True),
+    ("revert", "reverted", False),
+    ("manual", "needs_human", False),
+])
+def test_regression_decision_resolves(isolated_home, decision, expected, counts):
+    state, issue, w = _observing_state(num=42)
+    _run_sweep_entry(state, issue, w, cls="failed")      # → regression_detected
+    issue["regression_decision"] = decision              # Step −3 recorded the answer
+    _run_sweep_entry(state, issue, w, cls="failed")      # Step −5 applies it
+    orchestrator_state.write(state)
+    assert issue["status"] == expected
+    assert state["watch_list"] == []
+    assert state["completed_count"] == (1 if counts else 0)

@@ -1,6 +1,6 @@
 {
   "name": "orchestrator",
-  "version": "0.3.0-experimental",
+  "version": "0.4.0-experimental",
   "description": "Autonomous GitHub issue resolution loop (experimental). Lead Claude thread + 7 teammates (issue-analyzer / tester / issue-scout / product-planner / roadmap-strategist / vision-critic / system-doctor) + auto-invoked loopd /dev-task. Configurable response language, per-repo parallel instances, and self-healing stall recovery. See docs/orchestrator-design.md + docs/orchestrator-planning-layer.md.",
   "author": {
     "name": "BigggMorph",

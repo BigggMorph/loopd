@@ -653,3 +653,133 @@ def test_vision_critic_due_below_or_at_offset():
     # cycle == offset is excluded per design ("total > 12").
     assert ph.vision_critic_due(state, 12) is False
     assert ph.vision_critic_due(state, 37) is True
+
+
+# ---------- Rev 19: post-merge observation gate ----------
+
+def _merged(sha="abc123"):
+    return {"state": "MERGED", "mergeCommit": {"oid": sha}, "mergedAt": "2026-05-26T10:00:00+00:00"}
+
+
+def test_classify_ci_pending_merge_not_merged():
+    # --auto merge hasn't landed yet — never error, just wait.
+    assert ph.classify_ci_completion({"state": "OPEN"}, None, None) == "pending_merge"
+    assert ph.classify_ci_completion({"state": "MERGED"}, None, None) == "pending_merge"  # no sha
+
+
+def test_classify_ci_closed_unmerged():
+    assert ph.classify_ci_completion({"state": "CLOSED"}, None, None) == "closed_unmerged"
+
+
+def test_classify_ci_merged_but_ci_not_fetched_is_pending():
+    # Merge resolved but CI payloads are None (not fetched) → re-poll next sweep.
+    assert ph.classify_ci_completion(_merged(), None, None) == "pending_merge"
+
+
+def test_classify_ci_no_checks():
+    out = ph.classify_ci_completion(
+        _merged(), {"total_count": 0, "check_runs": []}, {"state": "", "statuses": []}
+    )
+    assert out == "no_checks"
+
+
+def test_classify_ci_running_when_any_in_progress():
+    cr = {"total_count": 2, "check_runs": [
+        {"status": "completed", "conclusion": "success"},
+        {"status": "in_progress", "conclusion": None},
+    ]}
+    assert ph.classify_ci_completion(_merged(), cr, {"state": "", "statuses": []}) == "running"
+
+
+def test_classify_ci_running_when_combined_pending():
+    assert ph.classify_ci_completion(
+        _merged(), {"total_count": 0, "check_runs": []},
+        {"state": "pending", "statuses": [{"state": "pending"}]},
+    ) == "running"
+
+
+def test_classify_ci_failed_on_failure_conclusion():
+    cr = {"total_count": 2, "check_runs": [
+        {"status": "completed", "conclusion": "success"},
+        {"status": "completed", "conclusion": "failure"},
+    ]}
+    assert ph.classify_ci_completion(_merged(), cr, {"state": "", "statuses": []}) == "failed"
+
+
+def test_classify_ci_failed_on_timed_out_and_cancelled():
+    for bad in ("timed_out", "cancelled", "action_required"):
+        cr = {"total_count": 1, "check_runs": [{"status": "completed", "conclusion": bad}]}
+        assert ph.classify_ci_completion(_merged(), cr, {"state": "", "statuses": []}) == "failed"
+
+
+def test_classify_ci_failed_on_combined_failure():
+    assert ph.classify_ci_completion(
+        _merged(), {"total_count": 0, "check_runs": []},
+        {"state": "failure", "statuses": [{"state": "failure"}]},
+    ) == "failed"
+
+
+def test_classify_ci_passed_with_neutral_and_skipped_not_failing():
+    cr = {"total_count": 3, "check_runs": [
+        {"status": "completed", "conclusion": "success"},
+        {"status": "completed", "conclusion": "neutral"},
+        {"status": "completed", "conclusion": "skipped"},
+    ]}
+    assert ph.classify_ci_completion(_merged(), cr, {"state": "success", "statuses": [{"state": "success"}]}) == "passed"
+
+
+def test_classify_ci_actions_only_status_pending_is_not_running():
+    # Real-world: Actions-only repo. /status returns state="pending" with zero
+    # legacy statuses; /check-runs holds the real (all-green) result. Must be
+    # "passed", NOT "running" (regression guard for the combined-state trap).
+    cr = {"total_count": 2, "check_runs": [
+        {"status": "completed", "conclusion": "success"},
+        {"status": "completed", "conclusion": "success"},
+    ]}
+    combined = {"state": "pending", "statuses": []}   # GitHub default for no statuses
+    assert ph.classify_ci_completion(_merged(), cr, combined) == "passed"
+
+
+def test_classify_ci_actions_only_failure_still_failed():
+    cr = {"total_count": 1, "check_runs": [{"status": "completed", "conclusion": "failure"}]}
+    combined = {"state": "pending", "statuses": []}
+    assert ph.classify_ci_completion(_merged(), cr, combined) == "failed"
+
+
+def test_classify_ci_running_precedes_failed():
+    # A failure already present but something still in flight → running, not failed.
+    cr = {"total_count": 2, "check_runs": [
+        {"status": "completed", "conclusion": "failure"},
+        {"status": "queued", "conclusion": None},
+    ]}
+    assert ph.classify_ci_completion(_merged(), cr, {"state": "", "statuses": []}) == "running"
+
+
+def test_observe_cap_minutes_default_and_override(monkeypatch):
+    monkeypatch.delenv("ORCHESTRATOR_OBSERVE_CAP_MIN", raising=False)
+    assert ph.observe_cap_minutes() == ph.OBSERVE_CAP_MIN_DEFAULT == 60
+    monkeypatch.setenv("ORCHESTRATOR_OBSERVE_CAP_MIN", "30")
+    assert ph.observe_cap_minutes() == 30
+
+
+def test_observe_cap_minutes_invalid_falls_back(monkeypatch):
+    monkeypatch.setenv("ORCHESTRATOR_OBSERVE_CAP_MIN", "not-a-number")
+    assert ph.observe_cap_minutes() == 60
+
+
+def test_observe_cap_minutes_clamped(monkeypatch):
+    monkeypatch.setenv("ORCHESTRATOR_OBSERVE_CAP_MIN", "0")
+    assert ph.observe_cap_minutes() == 1       # lower clamp
+    monkeypatch.setenv("ORCHESTRATOR_OBSERVE_CAP_MIN", "99999")
+    assert ph.observe_cap_minutes() == 1440    # upper clamp
+
+
+def test_observe_poll_minutes_default_override_clamp(monkeypatch):
+    monkeypatch.delenv("ORCHESTRATOR_OBSERVE_POLL_MIN", raising=False)
+    assert ph.observe_poll_minutes() == ph.OBSERVE_POLL_MIN_DEFAULT == 5
+    monkeypatch.setenv("ORCHESTRATOR_OBSERVE_POLL_MIN", "2")
+    assert ph.observe_poll_minutes() == 2
+    monkeypatch.setenv("ORCHESTRATOR_OBSERVE_POLL_MIN", "garbage")
+    assert ph.observe_poll_minutes() == 5
+    monkeypatch.setenv("ORCHESTRATOR_OBSERVE_POLL_MIN", "999")
+    assert ph.observe_poll_minutes() == 60     # upper clamp

@@ -9,8 +9,14 @@ Claude thread runs an `/orchestrator` playbook that:
    issue should be processed / split / handed to a human.
 3. Invokes `loopd:dev-task` directly (no human in the loop) to produce a PR.
 4. Sends the PR to the `tester` teammate for sandboxed verification.
-5. Merges (or requests human confirmation for risky / uncertain verdicts).
-6. Watches the merged PR for a 6h regression window, then moves on.
+5. Merges (or requests human confirmation for risky / uncertain verdicts),
+   then **immediately frees up to pick the next issue** — the merged PR is
+   observed in the background (it does not block throughput).
+6. Observes the merged PR in the background via a CI-completion gate: when the
+   squash-merge commit's CI on `main` passes it finalizes the issue; a CI
+   failure / external revert / cross-referenced bug raises a regression
+   decision. A short safety cap (`ORCHESTRATOR_OBSERVE_CAP_MIN`, default 60m)
+   finalizes if CI never reports.
 
 `loopd`'s deterministic FSM is preserved 100% — orchestrator never edits
 loopd files. The two plugins talk only through Skill invocation and a Stop

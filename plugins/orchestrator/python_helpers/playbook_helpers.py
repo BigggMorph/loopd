@@ -991,6 +991,138 @@ def clear_doctor_fields(state: Dict[str, Any]) -> None:
                 state[field] = None
 
 
+# ── Post-merge observation gate (Rev 19) ──────────────────────────────────
+# The lead runs the gh calls and passes the parsed JSON in; these stay pure so
+# they can be unit-tested without GitHub. See SKILL.md Step −5.
+
+OBSERVE_CAP_MIN_DEFAULT = 60
+OBSERVE_POLL_MIN_DEFAULT = 5
+_OBSERVE_CAP_CLAMP = (1, 1440)  # 1 min .. 24h
+_OBSERVE_POLL_CLAMP = (1, 60)   # 1 min .. 1h
+
+# check-run conclusions treated as a failure for the post-merge gate.
+# success / neutral / skipped / stale are NOT failures (a path-filtered or
+# skipped job must not block done_final); cancelled / timed_out /
+# action_required ARE (a hung or aborted required check on main is a regression
+# signal).
+_CI_FAILING_CONCLUSIONS = {"failure", "cancelled", "timed_out", "action_required"}
+
+
+def _env_int(name: str, default: int, lo: int, hi: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        val = int(str(raw).strip())
+    except (ValueError, TypeError):
+        return default
+    return max(lo, min(hi, val))
+
+
+def observe_cap_minutes() -> int:
+    """Safety cap (minutes after merge) before an observation entry is
+    force-resolved to done_final when CI never reports a conclusion / no CI
+    exists on the repo.
+
+    Env ORCHESTRATOR_OBSERVE_CAP_MIN (default 60, clamped 1..1440).
+    """
+    return _env_int(
+        "ORCHESTRATOR_OBSERVE_CAP_MIN", OBSERVE_CAP_MIN_DEFAULT, *_OBSERVE_CAP_CLAMP
+    )
+
+
+def observe_poll_minutes() -> int:
+    """Minimum minutes between CI polls for a single watch entry, so frequent
+    wakes (e.g. every teammate reply) don't hammer the GitHub API.
+
+    Env ORCHESTRATOR_OBSERVE_POLL_MIN (default 5, clamped 1..60).
+    """
+    return _env_int(
+        "ORCHESTRATOR_OBSERVE_POLL_MIN", OBSERVE_POLL_MIN_DEFAULT, *_OBSERVE_POLL_CLAMP
+    )
+
+
+def classify_ci_completion(
+    pr_view: Optional[Dict[str, Any]],
+    check_runs: Optional[Dict[str, Any]],
+    combined_status: Optional[Dict[str, Any]],
+) -> str:
+    """Classify the post-merge CI state of a (squash-)merged PR.
+
+    Pure over already-fetched gh JSON (the lead runs the gh calls):
+      pr_view         = ``gh pr view <url> --json state,mergeCommit,mergedAt``
+      check_runs      = ``gh api repos/{o}/{r}/commits/{sha}/check-runs``
+      combined_status = ``gh api repos/{o}/{r}/commits/{sha}/status``
+
+    ``check_runs`` / ``combined_status`` may be ``None`` when the caller has
+    only resolved the merge state (cheap first probe before spending the two
+    ``gh api`` calls); a merged PR with no CI data fetched yet stays
+    ``pending_merge`` so the next sweep re-polls.
+
+    Returns one of:
+      ``"pending_merge"``   — PR not MERGED yet (auto-merge still queued), no
+                              merge SHA, or CI not fetched yet → keep waiting.
+      ``"closed_unmerged"`` — PR closed without merging → surface to user.
+      ``"no_checks"``       — merged, but the commit has zero checks/statuses.
+      ``"running"``         — ≥1 check still queued/in_progress (or combined
+                              status pending).
+      ``"failed"``          — a check failed / cancelled / timed_out /
+                              action_required, or combined status failure.
+      ``"passed"``          — every check concluded non-failing.
+
+    Precedence is running → failed → passed: never declare passed while
+    anything is still in flight, never declare failed until a pending check
+    that might flip it has resolved.
+    """
+    pv = pr_view or {}
+    state = (pv.get("state") or "").upper()
+    if state == "CLOSED":
+        return "closed_unmerged"
+    sha = pv.get("sha") or ((pv.get("mergeCommit") or {}).get("oid"))
+    if state != "MERGED" or not sha:
+        return "pending_merge"
+    if check_runs is None and combined_status is None:
+        # Merge resolved but CI not fetched yet — re-poll next sweep.
+        return "pending_merge"
+
+    cr = check_runs or {}
+    runs = cr.get("runs")
+    if runs is None:
+        runs = cr.get("check_runs") or []
+    n_checkruns = cr.get("total")
+    if n_checkruns is None:
+        n_checkruns = cr.get("total_count")
+    if n_checkruns is None:
+        n_checkruns = len(runs)
+
+    cs = combined_status or {}
+    statuses = cs.get("statuses") or []
+    n_statuses = cs.get("count")
+    if n_statuses is None:
+        n_statuses = len(statuses)
+    combined_state = (cs.get("state") or "").lower()
+    # The combined-status API returns state="pending" for a commit with ZERO
+    # legacy statuses — which is the normal case for Actions-only repos. Treating
+    # that as "running" would wedge the gate forever, so only trust combined_state
+    # when there is at least one legacy status.
+    combined_meaningful = (n_statuses or 0) > 0
+
+    if (n_checkruns or 0) + (n_statuses or 0) == 0:
+        return "no_checks"
+
+    any_running = (combined_meaningful and combined_state == "pending") or any(
+        (r.get("status") or "").lower() != "completed" for r in runs
+    )
+    if any_running:
+        return "running"
+    any_failed = (combined_meaningful and combined_state == "failure") or any(
+        (r.get("conclusion") or "").lower() in _CI_FAILING_CONCLUSIONS for r in runs
+    )
+    if any_failed:
+        return "failed"
+    return "passed"
+
+
 __all__ = [
     "SPLIT_EPIC_MARKER",
     "parse_json_tail",
@@ -1019,4 +1151,10 @@ __all__ = [
     "vision_critic_due",
     "expire_vision_critic_pending_delta",
     "truncate_phase_context",
+    # Rev 19 — post-merge observation gate
+    "classify_ci_completion",
+    "observe_cap_minutes",
+    "observe_poll_minutes",
+    "OBSERVE_CAP_MIN_DEFAULT",
+    "OBSERVE_POLL_MIN_DEFAULT",
 ]
