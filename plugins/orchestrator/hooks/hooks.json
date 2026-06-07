@@ -1,0 +1,16 @@
+{
+  "description": "Orchestrator dev-done detector — re-injects /orchestrator after the loopd dev pipeline completes (β mechanism, see docs/orchestrator-design.md §11A).",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/orch-stop.sh\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
