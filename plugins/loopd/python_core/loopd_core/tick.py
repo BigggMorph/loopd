@@ -529,7 +529,7 @@ def _build_next_action(task_dict: dict[str, Any], workspace_path: Path) -> dict[
             }
 
     iteration = len(task_dict.get("turns") or []) + 1
-    prompt = _build_prompt(agent, task_dict, workspace_path)
+    prompt = _build_prompt(agent, task_dict, workspace_path).rstrip()
     token = mint_token(task_dict["id"], iteration, agent, prompt)
 
     return {
