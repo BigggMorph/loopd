@@ -538,11 +538,21 @@ except RuntimeError as exc:
 orchestrator_state.mark_dev_started(state, session_id)
 transition(issue, "dev_running")
 write(state)                              # MUST flush before Skill call
+
+# Dev pipeline selection (experimental). When the user has opted into loopd's
+# dev_v2 pipeline via the LOOPD_DEV_PIPELINE=v2 env var, pass pipeline:v2 plus
+# a token budget mapped from analyzer complexity. Default (unset/v1) keeps the
+# 5-phase pipeline — do NOT default to v2 until the feature_bench A/B passes.
+pipeline_args = ""
+if os.environ.get("LOOPD_DEV_PIPELINE") == "v2":
+    budget_k = {1: 200, 2: 300, 3: 400, 4: 600}.get(issue.complexity_level, 400)
+    pipeline_args = f" pipeline:v2 budget:{budget_k}k"
+
 Skill(skill="loopd:dev-task",
       args=f'"{issue.dev_task_prompt}" '
            f'repo:{state.repo} '
            f'level:{issue.complexity_level} '
-           f'branch:main')
+           f'branch:main' + pipeline_args)
 return                                    # window now belongs to loopd
 ```
 

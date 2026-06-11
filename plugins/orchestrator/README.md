@@ -52,6 +52,13 @@ Both `loopd` and `orchestrator` plugins must be enabled.
 > /orchestrator stop:true       # graceful shutdown
 ```
 
+### dev_v2 pipeline opt-in (experimental)
+
+Set `LOOPD_DEV_PIPELINE=v2` in the orchestrator session's environment to have
+the lead dispatch `/dev-task` with `pipeline:v2` and a complexity-mapped token
+budget (level 1→200k, 2→300k, 3→400k, 4→600k). Default is loopd's v1
+5-phase pipeline; do not flip this on until the feature_bench A/B passes.
+
 ### Parallel repos
 
 Each repo gets its own state under `~/.loopd/orchestrator/<repo-slug>/state.json`

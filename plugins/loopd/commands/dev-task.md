@@ -1,6 +1,6 @@
 ---
 description: loopd 신규 dev task 시작 — planning → implementation → review를 한 창에서 동기 실행
-argument-hint: '"<요구사항>" repo:<owner/repo> [level:0-4] [branch:<base>] [pipeline:v1|v2]'
+argument-hint: '"<요구사항>" repo:<owner/repo> [level:0-4] [branch:<base>] [pipeline:v1|v2] [budget:<tokens|Nk>]'
 allowed-tools:
   - Bash(${CLAUDE_PLUGIN_ROOT}/python_core/scripts/tick:*)
   - Task
@@ -74,3 +74,8 @@ PR이 만들어지고 review가 `approve`를 내면 loopd가 세션을 정리하
 표시하면 fresh 컨텍스트 리뷰어가 호출됩니다 (`request_changes` → developer
 재호출 루프, 백스톱 8회). 메인 LLM 입장에서의 절차는 v1과 완전히 동일합니다 —
 hooks가 흐름을 처리합니다.
+
+완료 선언은 결정적 출구 게이트로 검증됩니다: PR 실존(`gh pr view`), 위험 경로
+(auth/migration/security 등)·대형 diff(>200줄) 시 리뷰 강제 삽입, 테스트 로그
+증빙(`_loopd/<task_id>/test_log.txt`), 토큰 예산(`budget:400k` 형식, 기본
+400k — 소진 시 checkpoint_human).

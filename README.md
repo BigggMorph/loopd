@@ -67,6 +67,20 @@ To pick up where a previous window left off:
 /resume-task task-2026-05-19-001
 ```
 
+### pipeline:v2 (experimental)
+
+```
+/dev-task "버그 고쳐줘" repo:owner/repo pipeline:v2 budget:300k
+```
+
+`pipeline:v2` replaces the fixed 5-phase pipeline with a single **developer**
+agent that holds the workflow as a playbook and judges per-task which steps
+(plan doc, new tests, independent review) are needed. tick demotes from
+sequencer to gatekeeper: deterministic exit gates verify the completion claim
+(PR existence via `gh pr view`, forced review on risky-path/large diffs, test
+log evidence, token budget). v1 remains the default until the feature_bench
+A/B comparison passes (`scripts/eval/feature_bench_run.py --pipeline v2`).
+
 ## How it works
 
 - `tick.py` is the deterministic FSM driver. It reads task state, computes the next subagent + prompt, and emits a JSON `next_action` to stdout.
