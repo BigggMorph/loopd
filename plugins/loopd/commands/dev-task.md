@@ -1,6 +1,6 @@
 ---
 description: loopd 신규 dev task 시작 — planning → implementation → review를 한 창에서 동기 실행
-argument-hint: '"<요구사항>" repo:<owner/repo> [level:0-4] [branch:<base>]'
+argument-hint: '"<요구사항>" repo:<owner/repo> [level:0-4] [branch:<base>] [pipeline:v1|v2]'
 allowed-tools:
   - Bash(${CLAUDE_PLUGIN_ROOT}/python_core/scripts/tick:*)
   - Task
@@ -65,3 +65,12 @@ hide-from-slash-command-tool: "true"
 Task가 완료되면 PostToolUse hook이 `tick --record`를 자동 실행하고, Stop hook이 다음 next_action을 system message로 주입합니다. 당신은 그 system message를 받으면 Step 2와 같은 방식으로 `Task`를 다시 호출하기만 하면 됩니다 — planning → plan-critic → implementation → solution-critic → review 순서가 자동으로 흘러갑니다.
 
 PR이 만들어지고 review가 `approve`를 내면 loopd가 세션을 정리하고 종료합니다.
+
+## pipeline:v2 (실험적)
+
+`pipeline:v2`를 붙이면 5단계 파이프라인 대신 단일 **developer** 에이전트가
+전체 작업(이해→계획→구현→검증→PR)을 한 컨텍스트에서 수행합니다. 각 단계의
+필요 여부는 developer가 스스로 판단하고, 출구 보고서에 `review: "requested"`로
+표시하면 fresh 컨텍스트 리뷰어가 호출됩니다 (`request_changes` → developer
+재호출 루프, 백스톱 8회). 메인 LLM 입장에서의 절차는 v1과 완전히 동일합니다 —
+hooks가 흐름을 처리합니다.

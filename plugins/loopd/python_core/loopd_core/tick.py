@@ -124,6 +124,7 @@ _LEVEL_RE = re.compile(r"\blevel:(\d+)")
 _BRANCH_RE = re.compile(r"\bbranch:([^\s]+)")
 _ISSUE_RE = re.compile(r"\bissue:(\d+)")
 _PRIORITY_RE = re.compile(r"\bpriority:(\d+)")
+_PIPELINE_RE = re.compile(r"\bpipeline:(v1|v2)\b")
 
 
 def parse_dev_task_args(raw: str) -> dict[str, Any]:
@@ -139,13 +140,15 @@ def parse_dev_task_args(raw: str) -> dict[str, Any]:
     repo_m = _REPO_RE.search(raw)
     level_m = _LEVEL_RE.search(raw)
     branch_m = _BRANCH_RE.search(raw)
+    pipeline_m = _PIPELINE_RE.search(raw)
 
     repo = repo_m.group(1) if repo_m else None
     level = int(level_m.group(1)) if level_m else 1
     branch = branch_m.group(1) if branch_m else "main"
+    pipeline = pipeline_m.group(1) if pipeline_m else "v1"
 
     cleaned = raw
-    for m in (repo_m, level_m, branch_m):
+    for m in (repo_m, level_m, branch_m, pipeline_m):
         if m:
             cleaned = cleaned.replace(m.group(0), "")
     prompt = cleaned.strip().strip('"').strip("'").strip()
@@ -155,7 +158,8 @@ def parse_dev_task_args(raw: str) -> dict[str, Any]:
     if not repo:
         raise ValueError("dev-task: repo:<owner/repo> is required")
 
-    return {"prompt": prompt, "repo": repo, "level": level, "branch": branch}
+    return {"prompt": prompt, "repo": repo, "level": level, "branch": branch,
+            "pipeline": pipeline}
 
 
 def parse_research_task_args(raw: str) -> dict[str, Any]:
@@ -365,6 +369,93 @@ def _is_swe_bench_task(task_dict: dict[str, Any]) -> bool:
     return (task_dict.get("task_type") or "dev") == "swe_bench"
 
 
+def _is_dev_v2_task(task_dict: dict[str, Any]) -> bool:
+    return (task_dict.get("task_type") or "dev") == "dev_v2"
+
+
+# dev_v2: hard backstop on developer re-invocations. The primary limit will be
+# a token budget (Step 2); this count exists to stop pathological loops where
+# each iteration is cheap enough to never exhaust the budget.
+_DEV_V2_MAX_DEVELOPER_TURNS = 8
+
+
+def _completed_turns(task_dict: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        t for t in (task_dict.get("turns") or [])
+        if t.get("state") in ("completed", "COMPLETED")
+    ]
+
+
+def _turn_subagent(turn: dict[str, Any]) -> Optional[str]:
+    return turn.get("subagent") or turn.get("agent")
+
+
+def parse_exit_report(result: str) -> Optional[dict[str, Any]]:
+    """Extract the developer's exit-report JSON from a turn result.
+
+    The contract is "exactly one raw JSON line at the end", but agents drift:
+    code fences, trailing prose, truncation. Scan lines from the end and return
+    the first parseable JSON object that carries a ``phase`` field.
+    """
+    if not result:
+        return None
+    for line in reversed(result.strip().splitlines()):
+        line = line.strip().strip("`")
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and obj.get("phase"):
+            return obj
+    return None
+
+
+def _next_agent_dev_v2(task_dict: dict[str, Any]) -> Optional[str]:
+    """dev_v2 routing: developer → (review when requested) → complete.
+
+    Unlike v1, the workflow lives in the developer agent's playbook — tick only
+    honours the agent's declared judgment (``review: requested | skipped``) and
+    closes the review loop (``request_changes`` → developer with feedback).
+    A missing/unparseable exit report is treated as ``review: requested``: the
+    conservative reading of "the agent failed to prove its work is done".
+    """
+    completed = _completed_turns(task_dict)
+    if not completed:
+        return "developer"
+
+    last = completed[-1]
+    sub = _turn_subagent(last)
+
+    if sub == "developer":
+        report = parse_exit_report(last.get("result") or "")
+        if report is None:
+            return "review"
+        if report.get("status") == "failed":
+            # blocked — re-running without new information won't help;
+            # _build_next_action turns this into checkpoint_human.
+            return None
+        if report.get("review") == "requested":
+            return "review"
+        return None
+
+    if sub == "review":
+        if _critic_verdict_fail(last):
+            return "developer"
+        return None
+
+    return None
+
+
+def _dev_v2_last_report(task_dict: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Exit report of the most recent completed developer turn, if any."""
+    for t in reversed(_completed_turns(task_dict)):
+        if _turn_subagent(t) == "developer":
+            return parse_exit_report(t.get("result") or "")
+    return None
+
+
 def _next_agent_swe_bench(task_dict: dict[str, Any]) -> Optional[str]:
     """SWE-bench pipeline: single implementation turn, no planning/review."""
     turns = task_dict.get("turns") or []
@@ -404,6 +495,19 @@ def _build_prompt(agent: str, task_dict: dict[str, Any], workspace_path: Path) -
     metadata = task_dict.get("metadata") or {}
     is_research = _is_research_task(task_dict)
     artifact_names = [a.get("name") or a.get("path", "") for a in task_dict.get("artifacts", [])]
+
+    # dev_v2: when re-invoking the developer after a review round, surface the
+    # reviewer's feedback so the new invocation knows what to fix.
+    review_feedback = "(none — first invocation)"
+    if agent == "developer":
+        last_review = next(
+            (t for t in reversed(_completed_turns(task_dict))
+             if _turn_subagent(t) == "review"),
+            None,
+        )
+        if last_review:
+            review_feedback = (last_review.get("result") or "")[-2000:]
+
     ctx = {
         "TASK_ID": task_dict.get("id", ""),
         "TASK_PROMPT": task_dict.get("prompt", ""),
@@ -417,6 +521,8 @@ def _build_prompt(agent: str, task_dict: dict[str, Any], workspace_path: Path) -
         "RESEARCH_TOPIC": task_dict.get("prompt", "") if is_research else "",
         "GITHUB_ISSUE": str(metadata.get("github_issue") or ""),
         "GITHUB_REPO": metadata.get("github_repo") or "",
+        # dev_v2-specific
+        "REVIEW_FEEDBACK": review_feedback,
     }
 
     rendered = render(base, ctx)
@@ -454,6 +560,20 @@ def _build_prompt(agent: str, task_dict: dict[str, Any], workspace_path: Path) -
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _truncate_keep_tail(text: str, limit: int) -> str:
+    """Truncate to ``limit`` chars, preserving head AND tail.
+
+    Verdict / exit-report JSON lives on the *last* line of agent results, so a
+    plain head-only slice silently drops it on long outputs — which made
+    ``_critic_verdict_fail`` read a FAIL verdict as an implicit approve.
+    """
+    if len(text) <= limit:
+        return text
+    head = limit // 3
+    tail = limit - head - len("\n...[truncated]...\n")
+    return text[:head] + "\n...[truncated]...\n" + text[-tail:]
+
+
 def _emit(payload: dict[str, Any]) -> int:
     print(json.dumps(payload, default=str), flush=True)
     return 0
@@ -478,7 +598,46 @@ def _build_next_action(task_dict: dict[str, Any], workspace_path: Path) -> dict[
                 "question": task_dict.get("checkpoint_question",
                                           "loopd: human input required.")}
 
-    if _is_swe_bench_task(task_dict):
+    if _is_dev_v2_task(task_dict):
+        agent = _next_agent_dev_v2(task_dict)
+
+        if agent is None:
+            last_report = _dev_v2_last_report(task_dict)
+            if last_report and last_report.get("status") == "failed":
+                return {
+                    "kind": "checkpoint_human",
+                    "task_id": task_dict.get("id"),
+                    "question": (
+                        "loopd dev_v2: developer reported it is blocked.\n\n"
+                        f"Error: {last_report.get('error', '(no error detail)')}\n"
+                        f"Summary: {last_report.get('summary', '')}"
+                    ),
+                }
+            return {"kind": "complete", "task_id": task_dict.get("id")}
+
+        if agent == "developer":
+            developer_turns = sum(
+                1 for t in _completed_turns(task_dict)
+                if _turn_subagent(t) == "developer"
+            )
+            if developer_turns >= _DEV_V2_MAX_DEVELOPER_TURNS:
+                last_review = next(
+                    (t for t in reversed(_completed_turns(task_dict))
+                     if _turn_subagent(t) == "review"),
+                    None,
+                )
+                feedback = ((last_review or {}).get("result") or "")[-1500:]
+                return {
+                    "kind": "checkpoint_human",
+                    "task_id": task_dict.get("id"),
+                    "question": (
+                        f"loopd dev_v2: developer turn backstop "
+                        f"({_DEV_V2_MAX_DEVELOPER_TURNS}) reached without review "
+                        f"approval. Inspect the latest review feedback and decide "
+                        f"manually.\n\nLast review feedback:\n{feedback}"
+                    ),
+                }
+    elif _is_swe_bench_task(task_dict):
         agent = _next_agent_swe_bench(task_dict)
         if agent is None:
             return {"kind": "complete", "task_id": task_dict.get("id")}
@@ -634,7 +793,7 @@ def _cmd_init_dev(args: argparse.Namespace) -> int:
         level=parsed["level"],
         workspace_repo=parsed["repo"],
         workspace_branch=parsed["branch"],
-        task_type="dev",
+        task_type="dev_v2" if parsed.get("pipeline") == "v2" else "dev",
     )
 
     wm = WorkspaceManager(cfg)
@@ -813,7 +972,7 @@ def cmd_record(args: argparse.Namespace) -> int:
     cost_usd = float((payload.get("tokens") or {}).get("cost_usd") or 0.0)
     duration_ms = int(payload.get("duration_ms") or 0)
     model = payload.get("model") or "unknown"
-    result = (payload.get("result") or "")[:4000]
+    result = _truncate_keep_tail(payload.get("result") or "", 4000)
     error = payload.get("error")
 
     sm.end_turn(

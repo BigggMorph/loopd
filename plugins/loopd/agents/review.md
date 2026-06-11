@@ -15,6 +15,8 @@ color: yellow
 1. `cd {{WORKSPACE_PATH}}` 후 `git log --oneline {{BRANCH}}..HEAD`로 implementation이 만든 커밋들을 확인.
 2. `git diff {{BRANCH}}...HEAD`로 전체 변경사항 분석.
 3. `_loopd/{{TASK_ID}}/prd.md`의 Acceptance Criteria 각 항목이 실제로 충족됐는지 검증.
+   prd.md가 없으면(dev_v2 파이프라인) 원래 task 요청문과 PR body를 기준으로
+   "사용자가 요청한 것이 실제로 구현되었는가"를 판단.
 4. 다음 관점에서 비판적으로 검토:
    - **Correctness**: 로직 오류, off-by-one, race condition
    - **Tests**: 새 코드 경로에 대응하는 테스트가 있는가? 엣지 케이스 누락은?

@@ -62,6 +62,16 @@ def _extract_text(tool_response: dict) -> str:
     return ""
 
 
+def _truncate_keep_tail(text: str, limit: int) -> str:
+    """Truncate preserving head AND tail — verdict/exit-report JSON sits on
+    the last line of agent results and must survive truncation."""
+    if len(text) <= limit:
+        return text
+    head = limit // 3
+    tail = limit - head - len("\n...[truncated]...\n")
+    return text[:head] + "\n...[truncated]...\n" + text[-tail:]
+
+
 def main() -> int:
     raw = sys.stdin.read()
     try:
@@ -88,7 +98,7 @@ def main() -> int:
         return 0
 
     tool_response = payload.get("tool_response") or {}
-    result_text = _extract_text(tool_response)[:10000]
+    result_text = _truncate_keep_tail(_extract_text(tool_response), 10000)
     usage = tool_response.get("usage") or {}
 
     record = {
