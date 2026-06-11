@@ -401,6 +401,34 @@ def _install_c_extension_stubs(worktree_path: Path, python_exec: Path) -> None:
             f"# The real {mod_name} is a C extension that couldn't be built.\n"
         )
 
+    # astropy 6.0.dev moved _tiled_compression._compression (C ext) from
+    # fits/hdu/compressed/ to fits/_tiled_compression/. The released 6.0 binary
+    # wheel still has it at the old path. Copy the .so to the new location.
+    # (A redirect stub won't work because PYTHONPATH puts the worktree first and
+    # worktree has hdu/compressed.py as a module, shadowing the venv's compressed/ pkg.)
+    tiled_comp_dir = worktree_path / "astropy" / "io" / "fits" / "_tiled_compression"
+    if (
+        tiled_comp_dir.exists()
+        and (tiled_comp_dir / "codecs.py").exists()
+        and "_tiled_compression._compression" in (tiled_comp_dir / "codecs.py").read_text(errors="ignore")
+        and not any(tiled_comp_dir.glob("_compression*.so"))
+    ):
+        import glob as _glob
+        venv_site = python_exec.parent.parent / "lib"
+        so_candidates = list(venv_site.glob(
+            "python*/site-packages/astropy/io/fits/hdu/compressed/_compression*.so"
+        ))
+        if so_candidates:
+            dst = tiled_comp_dir / so_candidates[0].name
+            try:
+                shutil.copy2(str(so_candidates[0]), str(dst))
+                logger.info(
+                    f"Copied _compression.so to _tiled_compression/ "
+                    f"(astropy 6.0.dev C ext relocation)"
+                )
+            except Exception as _e:
+                logger.warning(f"Could not copy _compression.so: {_e}")
+
     # astropy < 4.x has astropy/_erfa/ufunc as a Cython extension that isn't in
     # PyPI binary wheels. Modern pyerfa (installed alongside astropy 5.x) has a
     # compatible ufunc module. Create a redirect stub if the worktree needs it.

@@ -361,6 +361,23 @@ def _is_research_task(task_dict: dict[str, Any]) -> bool:
     return (task_dict.get("task_type") or "dev") == "research"
 
 
+def _is_swe_bench_task(task_dict: dict[str, Any]) -> bool:
+    return (task_dict.get("task_type") or "dev") == "swe_bench"
+
+
+def _next_agent_swe_bench(task_dict: dict[str, Any]) -> Optional[str]:
+    """SWE-bench pipeline: single implementation turn, no planning/review."""
+    turns = task_dict.get("turns") or []
+    completed = [
+        t.get("subagent") or t.get("agent")
+        for t in turns
+        if t.get("state") in ("completed", "COMPLETED")
+    ]
+    if "swe-bench" not in completed:
+        return "swe-bench"
+    return None
+
+
 def _research_dir_for(task_id: str) -> Path:
     from loopd_core.config import get_config
 
@@ -372,6 +389,7 @@ def _build_prompt(agent: str, task_dict: dict[str, Any], workspace_path: Path) -
     from loopd_core.prompt_renderer import render
 
     cfg = get_config()
+    # swe-bench agent uses "swe-bench.md"; hyphens are valid in filenames
     agent_md = cfg.plugin_root / "agents" / f"{agent}.md"
     base = agent_md.read_text() if agent_md.exists() else f"# {agent} subagent\n"
 
@@ -460,7 +478,11 @@ def _build_next_action(task_dict: dict[str, Any], workspace_path: Path) -> dict[
                 "question": task_dict.get("checkpoint_question",
                                           "loopd: human input required.")}
 
-    if _is_research_task(task_dict):
+    if _is_swe_bench_task(task_dict):
+        agent = _next_agent_swe_bench(task_dict)
+        if agent is None:
+            return {"kind": "complete", "task_id": task_dict.get("id")}
+    elif _is_research_task(task_dict):
         agent = _next_agent_research(task_dict)
         # research uses a flat dir, not a git worktree
         workspace_path = _research_dir_for(task_dict["id"])
