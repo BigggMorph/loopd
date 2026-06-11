@@ -112,17 +112,29 @@ def main() -> None:
     print(f"Verifying {len(task_files)} task(s) ...")
 
     resolved_count = total = 0
+    by_variant: dict[str, list[int]] = {}  # variant -> [resolved, total]
     for task_file in task_files:
         result = verify_task(task_file, results_dir, verbose=args.verbose)
         if result is not None:
             total += 1
             if result.resolved:
                 resolved_count += 1
+            try:
+                variant = json.loads(task_file.read_text()).get("pipeline_variant", "v1")
+            except Exception:
+                variant = "v1"
+            bucket = by_variant.setdefault(variant, [0, 0])
+            bucket[1] += 1
+            if result.resolved:
+                bucket[0] += 1
 
     if total > 0:
         pct = 100 * resolved_count / total
         print(f"\n{'='*60}")
         print(f"FeatureBench result: {resolved_count}/{total} resolved ({pct:.1f}%)")
+        if len(by_variant) > 1:
+            for variant, (res, tot) in sorted(by_variant.items()):
+                print(f"  pipeline {variant}: {res}/{tot} resolved ({100*res/tot:.1f}%)")
         print(f"(Baseline — OpenHands + Claude Opus 4.7 Lite: 46.7%)")
 
 

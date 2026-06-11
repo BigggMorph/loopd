@@ -87,7 +87,7 @@ def _status_summary(dirs: dict[str, Path]) -> dict[str, int]:
     }
 
 
-def _run_one(task_file: str, eval_root: str, timeout: int, model: str | None, max_turns: int, claude_bin: str) -> dict:
+def _run_one(task_file: str, eval_root: str, timeout: int, model: str | None, max_turns: int, claude_bin: str, pipeline: str = "v1") -> dict:
     import json
     import sys
     from datetime import datetime, timezone
@@ -116,10 +116,11 @@ def _run_one(task_file: str, eval_root: str, timeout: int, model: str | None, ma
     active_path = active_dir / task_path.name
     task["status"] = "active"
     task["updated_at"] = now()
+    task["pipeline_variant"] = pipeline
     active_path.write_text(json.dumps(task, indent=2, ensure_ascii=False), encoding="utf-8")
     task_path.unlink(missing_ok=True)
 
-    result = run_task(task, timeout=timeout, model=model, max_turns=max_turns, claude_bin=claude_bin)
+    result = run_task(task, timeout=timeout, model=model, max_turns=max_turns, claude_bin=claude_bin, pipeline=pipeline)
 
     task["updated_at"] = now()
     if result.success:
@@ -151,6 +152,10 @@ def main() -> None:
     parser.add_argument("--model", default=None)
     parser.add_argument("--max-turns", type=int, default=50)
     parser.add_argument("--claude-bin", default="claude")
+    parser.add_argument("--pipeline", choices=["v1", "v2"], default="v1",
+                        help="System-prompt variant: v1 = fixed-role, v2 = dev_v2 "
+                             "playbook framing (agent judges its own steps). "
+                             "Recorded as pipeline_variant for A/B comparison.")
     parser.add_argument("--task-id", default=None)
     parser.add_argument("--no-recover", action="store_true")
     parser.add_argument("--status", action="store_true")
@@ -214,7 +219,8 @@ def main() -> None:
 
     worker_kwargs = [
         {"task_file": str(p), "eval_root": str(eval_root), "timeout": args.timeout,
-         "model": args.model, "max_turns": args.max_turns, "claude_bin": args.claude_bin}
+         "model": args.model, "max_turns": args.max_turns, "claude_bin": args.claude_bin,
+         "pipeline": args.pipeline}
         for p in runnable
     ]
 

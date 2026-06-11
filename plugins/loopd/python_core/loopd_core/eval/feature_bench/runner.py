@@ -12,9 +12,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-_FB_SYSTEM_PROMPT = """\
-You are an expert software engineer implementing a new feature in a repository.
-
+_FB_STRICT_RULES = """\
 STRICT RULES:
 1. Implement ONLY source/library code. NEVER modify, add, or delete any file
    inside a `tests/` directory, or any file whose name starts with `test_`.
@@ -26,6 +24,32 @@ STRICT RULES:
 7. After implementing, verify with `git diff` that changes look correct.
 8. Commit: `git add <source-files-only> && git commit -m "feat: <description>"`.
 """
+
+# v1: the original fixed-role prompt (mirrors the staged-pipeline framing).
+_FB_SYSTEM_PROMPT = (
+    "You are an expert software engineer implementing a new feature in a "
+    "repository.\n\n" + _FB_STRICT_RULES
+)
+
+# v2: the dev_v2 playbook framing — the agent owns the whole task and judges
+# which steps it needs. Used for A/B comparison against v1.
+_FB_SYSTEM_PROMPT_V2 = """\
+You are a senior software engineer who owns this task end to end. There is no
+prescribed procedure — judge for yourself which steps this task needs
+(understanding the codebase, sketching a plan, implementing, self-verifying)
+and spend effort proportional to the task's actual complexity.
+
+Tendencies that serve you well:
+- Understand the relevant code before editing it.
+- For a bug-shaped task, reproduce the behavior first. For a refactor-shaped
+  task, behavior preservation is the bar. For a feature, define acceptance
+  criteria for yourself before implementing, and map your final diff to them.
+- Confidence in one's own work is systematically overestimated — re-read your
+  full diff with fresh eyes before declaring done.
+
+""" + _FB_STRICT_RULES
+
+_FB_SYSTEM_PROMPTS = {"v1": _FB_SYSTEM_PROMPT, "v2": _FB_SYSTEM_PROMPT_V2}
 
 _FB_USER_TEMPLATE = """\
 Repository: {repo}
@@ -69,6 +93,7 @@ def run_task(
     model: Optional[str] = None,
     max_turns: int = 50,
     claude_bin: str = "claude",
+    pipeline: str = "v1",
 ) -> RunResult:
     ws = task.get("workspace") or {}
     workspace_path_str = ws.get("path")
@@ -97,6 +122,7 @@ def run_task(
         problem_statement=task.get("prompt", ""),
     )
 
+    system_prompt = _FB_SYSTEM_PROMPTS.get(pipeline, _FB_SYSTEM_PROMPT)
     cmd = [
         claude_bin,
         "-p",
@@ -104,6 +130,7 @@ def run_task(
         "--allowedTools", "Edit", "Write", "Bash", "Read", "Glob", "Grep", "MultiEdit",
         "--output-format", "json",
         "--max-turns", str(max_turns),
+        "--append-system-prompt", system_prompt,
     ]
     if model:
         cmd.extend(["--model", model])
