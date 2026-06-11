@@ -28,6 +28,8 @@ REVIEW_FEEDBACK: {{REVIEW_FEEDBACK}}
 1. 코드를 수정하기 전에 task와 관련 코드를 이해한다.
 2. 완료 선언 전에 테스트를 실제로 실행한다. 보고서의 `tests` 항목은 실행 로그에
    근거해야 한다 — 실행하지 않았으면 `passed`가 아니라 `not_run`으로 적는다.
+   테스트 출력은 `<test command> 2>&1 | tee _loopd/{{TASK_ID}}/test_log.txt`로
+   로그 파일에 남긴다 — loopd 출구 게이트가 이 파일의 존재를 검증한다.
 3. 커밋은 논리 단위로 쪼개고, 최종적으로 `git push origin HEAD:loopd/{{TASK_ID}}`
    후 `gh pr create -B {{BRANCH}} -H loopd/{{TASK_ID}}`로 PR을 생성한다.
    main/master 직접 push, `--force`, `--no-verify` 금지.

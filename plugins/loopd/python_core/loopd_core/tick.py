@@ -125,6 +125,7 @@ _BRANCH_RE = re.compile(r"\bbranch:([^\s]+)")
 _ISSUE_RE = re.compile(r"\bissue:(\d+)")
 _PRIORITY_RE = re.compile(r"\bpriority:(\d+)")
 _PIPELINE_RE = re.compile(r"\bpipeline:(v1|v2)\b")
+_BUDGET_RE = re.compile(r"\bbudget:(\d+)(k?)\b", re.IGNORECASE)
 
 
 def parse_dev_task_args(raw: str) -> dict[str, Any]:
@@ -141,14 +142,20 @@ def parse_dev_task_args(raw: str) -> dict[str, Any]:
     level_m = _LEVEL_RE.search(raw)
     branch_m = _BRANCH_RE.search(raw)
     pipeline_m = _PIPELINE_RE.search(raw)
+    budget_m = _BUDGET_RE.search(raw)
 
     repo = repo_m.group(1) if repo_m else None
     level = int(level_m.group(1)) if level_m else 1
     branch = branch_m.group(1) if branch_m else "main"
     pipeline = pipeline_m.group(1) if pipeline_m else "v1"
+    budget = None
+    if budget_m:
+        budget = int(budget_m.group(1))
+        if budget_m.group(2).lower() == "k":
+            budget *= 1000
 
     cleaned = raw
-    for m in (repo_m, level_m, branch_m, pipeline_m):
+    for m in (repo_m, level_m, branch_m, pipeline_m, budget_m):
         if m:
             cleaned = cleaned.replace(m.group(0), "")
     prompt = cleaned.strip().strip('"').strip("'").strip()
@@ -159,7 +166,7 @@ def parse_dev_task_args(raw: str) -> dict[str, Any]:
         raise ValueError("dev-task: repo:<owner/repo> is required")
 
     return {"prompt": prompt, "repo": repo, "level": level, "branch": branch,
-            "pipeline": pipeline}
+            "pipeline": pipeline, "budget": budget}
 
 
 def parse_research_task_args(raw: str) -> dict[str, Any]:
@@ -373,10 +380,21 @@ def _is_dev_v2_task(task_dict: dict[str, Any]) -> bool:
     return (task_dict.get("task_type") or "dev") == "dev_v2"
 
 
-# dev_v2: hard backstop on developer re-invocations. The primary limit will be
-# a token budget (Step 2); this count exists to stop pathological loops where
-# each iteration is cheap enough to never exhaust the budget.
+# dev_v2: hard backstop on developer re-invocations. The primary limit is the
+# token budget; this count exists to stop pathological loops where each
+# iteration is cheap enough to never exhaust the budget.
 _DEV_V2_MAX_DEVELOPER_TURNS = 8
+
+# dev_v2 exit gates — deterministic checks applied when the developer declares
+# completion. The agent chooses its own process; these verify the outcome.
+_DEV_V2_DEFAULT_TOKEN_BUDGET = 400_000
+_DEV_V2_FORCED_REVIEW_DIFF_LINES = 200
+_DEV_V2_RISKY_PATH_TOKENS = (
+    "auth", "migration", "security", "payment", "secret", "crypt",
+    ".github/workflows", "dockerfile",
+)
+_DEV_V2_DOCS_SUFFIXES = (".md", ".rst", ".txt")
+_DEV_V2_TEST_LOG_NAME = "test_log.txt"
 
 
 def _completed_turns(task_dict: dict[str, Any]) -> list[dict[str, Any]]:
@@ -456,6 +474,192 @@ def _dev_v2_last_report(task_dict: dict[str, Any]) -> Optional[dict[str, Any]]:
     return None
 
 
+# ─── dev_v2 exit gates ───────────────────────────────────────────────────────
+
+
+def _dev_v2_git_diff_stats(
+    workspace_path: Optional[Path], base_branch: str
+) -> Optional[tuple[list[str], int]]:
+    """(changed file paths, total changed lines) vs base branch.
+
+    Returns ``None`` when the diff cannot be computed (no workspace, git
+    failure) — callers treat that as "unknown" and fail open on diff-based
+    gates rather than stalling the pipeline.
+    """
+    import subprocess
+
+    if not workspace_path or not Path(workspace_path).is_dir():
+        return None
+    try:
+        files_proc = subprocess.run(
+            ["git", "diff", "--name-only", f"{base_branch}...HEAD"],
+            cwd=str(workspace_path), capture_output=True, text=True, timeout=5,
+        )
+        num_proc = subprocess.run(
+            ["git", "diff", "--numstat", f"{base_branch}...HEAD"],
+            cwd=str(workspace_path), capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return None
+    if files_proc.returncode != 0 or num_proc.returncode != 0:
+        return None
+
+    files = [ln.strip() for ln in files_proc.stdout.splitlines() if ln.strip()]
+    total = 0
+    for ln in num_proc.stdout.splitlines():
+        parts = ln.split("\t")
+        if len(parts) >= 2:
+            for p in parts[:2]:
+                if p.isdigit():
+                    total += int(p)
+    return files, total
+
+
+def _dev_v2_pr_verified(report: dict[str, Any]) -> Optional[bool]:
+    """Does the reported pr_url resolve to a real PR?
+
+    ``True``/``False`` = verified / definitively missing. ``None`` = could not
+    check (gh unavailable, auth or network error) — fail open so a transient
+    outage never stalls the pipeline.
+    """
+    import subprocess
+
+    url = str(report.get("pr_url") or "")
+    if not url.startswith("http"):
+        return False
+    try:
+        proc = subprocess.run(
+            ["gh", "pr", "view", url, "--json", "state"],
+            capture_output=True, text=True, timeout=8,
+        )
+    except Exception:
+        return None
+    if proc.returncode == 0:
+        return True
+    err = (proc.stderr or "").lower()
+    if "not found" in err or "could not resolve" in err or "no pull requests" in err:
+        return False
+    return None
+
+
+def _dev_v2_reviews_satisfied(task_dict: dict[str, Any]) -> bool:
+    """True when the most recent completed review turn approved.
+
+    Used to skip the review-forcing gates after an independent review already
+    passed — otherwise a PR-gate rework after an approve would re-trigger a
+    forced review of the same (already approved) diff every cycle.
+    """
+    for t in reversed(_completed_turns(task_dict)):
+        if _turn_subagent(t) == "review":
+            return not _critic_verdict_fail(t)
+    return False
+
+
+def _dev_v2_exit_gate(
+    task_dict: dict[str, Any],
+    workspace_path: Optional[Path],
+    report: dict[str, Any],
+) -> Optional[tuple[str, str]]:
+    """Deterministic exit gates for a developer completion claim.
+
+    Returns ``(forced_agent, reason)`` on violation, ``None`` when all gates
+    pass. Gate semantics:
+
+    - PR gate (always): reported pr_url must resolve via ``gh pr view``.
+      Violation → developer rework (a reviewer can't fix a missing PR).
+    - Risky-path / large-diff gate (when review was skipped): diff touching
+      risky paths or exceeding the line threshold forces an independent
+      review, overriding the agent's skip judgment.
+    - Test-evidence gate (when review was skipped): a "passed" claim needs the
+      test log artifact; "failed"/"not_run" needs a docs-only diff. Anything
+      else forces review.
+    """
+    pr_ok = _dev_v2_pr_verified(report)
+    if pr_ok is False:
+        return (
+            "developer",
+            "exit gate: pr_url is missing or does not resolve to a real PR. "
+            "Push the branch and create the PR, then report again.",
+        )
+
+    if _dev_v2_reviews_satisfied(task_dict):
+        return None
+
+    base_branch = (task_dict.get("workspace") or {}).get("branch", "main")
+    stats = _dev_v2_git_diff_stats(workspace_path, base_branch)
+    changed, diff_lines = stats if stats else ([], None)
+
+    risky = [
+        f for f in changed
+        if any(tok in f.lower() for tok in _DEV_V2_RISKY_PATH_TOKENS)
+    ]
+    if risky:
+        return (
+            "review",
+            f"exit gate: diff touches risky paths {risky[:5]} — independent "
+            f"review is mandatory regardless of the developer's judgment.",
+        )
+    if diff_lines is not None and diff_lines > _DEV_V2_FORCED_REVIEW_DIFF_LINES:
+        return (
+            "review",
+            f"exit gate: diff size {diff_lines} lines exceeds "
+            f"{_DEV_V2_FORCED_REVIEW_DIFF_LINES} — independent review required.",
+        )
+
+    docs_only = bool(changed) and all(
+        f.lower().endswith(_DEV_V2_DOCS_SUFFIXES) for f in changed
+    )
+    tests_result = ((report.get("tests") or {}).get("result") or "not_run").lower()
+    if tests_result == "passed":
+        if workspace_path and Path(workspace_path).is_dir():
+            log_path = (
+                Path(workspace_path) / "_loopd" / str(task_dict.get("id") or "")
+                / _DEV_V2_TEST_LOG_NAME
+            )
+            if not (log_path.exists() and log_path.stat().st_size > 0):
+                return (
+                    "review",
+                    "exit gate: tests reported passed but no test log artifact "
+                    f"found at _loopd/<task_id>/{_DEV_V2_TEST_LOG_NAME} — "
+                    "claim is unverified, independent review required.",
+                )
+    elif not docs_only:
+        return (
+            "review",
+            f"exit gate: tests.result={tests_result} on a non-docs diff — "
+            "independent review required.",
+        )
+
+    return None
+
+
+def _dev_v2_token_spend(task_dict: dict[str, Any]) -> int:
+    """Estimated cumulative token spend across all turns.
+
+    Prefers real counts recorded by the hook; falls back to a chars/4
+    estimate of the (truncated) result so a usage-less harness still
+    accumulates something rather than zero.
+    """
+    total = 0
+    for t in task_dict.get("turns") or []:
+        spent = (int(t.get("input_tokens") or 0) + int(t.get("output_tokens") or 0))
+        if not spent:
+            spent = int(t.get("tokens") or 0)
+        if not spent:
+            spent = len(t.get("result") or "") // 4
+        total += spent
+    return total
+
+
+def _dev_v2_token_budget(task_dict: dict[str, Any]) -> int:
+    metadata = task_dict.get("metadata") or {}
+    try:
+        budget = int(metadata.get("token_budget") or 0)
+    except (TypeError, ValueError):
+        budget = 0
+    return budget or _DEV_V2_DEFAULT_TOKEN_BUDGET
+
+
 def _next_agent_swe_bench(task_dict: dict[str, Any]) -> Optional[str]:
     """SWE-bench pipeline: single implementation turn, no planning/review."""
     turns = task_dict.get("turns") or []
@@ -475,7 +679,12 @@ def _research_dir_for(task_id: str) -> Path:
     return get_config().loopd_root / "research-tasks" / task_id
 
 
-def _build_prompt(agent: str, task_dict: dict[str, Any], workspace_path: Path) -> str:
+def _build_prompt(
+    agent: str,
+    task_dict: dict[str, Any],
+    workspace_path: Path,
+    gate_note: Optional[str] = None,
+) -> str:
     from loopd_core.config import get_config
     from loopd_core.prompt_renderer import render
 
@@ -552,6 +761,8 @@ def _build_prompt(agent: str, task_dict: dict[str, Any], workspace_path: Path) -
             f"the workspace path above. Do not modify files anywhere else.\n\n"
             f"---\n\n"
         )
+    if gate_note:
+        header += f"**loopd exit-gate notice:** {gate_note}\n\n---\n\n"
     return header + rendered
 
 
@@ -598,6 +809,7 @@ def _build_next_action(task_dict: dict[str, Any], workspace_path: Path) -> dict[
                 "question": task_dict.get("checkpoint_question",
                                           "loopd: human input required.")}
 
+    gate_note: Optional[str] = None
     if _is_dev_v2_task(task_dict):
         agent = _next_agent_dev_v2(task_dict)
 
@@ -613,7 +825,28 @@ def _build_next_action(task_dict: dict[str, Any], workspace_path: Path) -> dict[
                         f"Summary: {last_report.get('summary', '')}"
                     ),
                 }
-            return {"kind": "complete", "task_id": task_dict.get("id")}
+            if last_report is not None:
+                gate = _dev_v2_exit_gate(task_dict, workspace_path, last_report)
+                if gate:
+                    agent, gate_note = gate
+            if agent is None:
+                return {"kind": "complete", "task_id": task_dict.get("id")}
+
+        # Budget gate — applies to any further dev_v2 invocation.
+        spend = _dev_v2_token_spend(task_dict)
+        budget = _dev_v2_token_budget(task_dict)
+        if spend >= budget:
+            return {
+                "kind": "checkpoint_human",
+                "task_id": task_dict.get("id"),
+                "question": (
+                    f"loopd dev_v2: token budget exhausted "
+                    f"(~{spend:,} spent / {budget:,} budget). Inspect the task "
+                    f"state and decide manually whether to raise the budget "
+                    f"(metadata.token_budget), accept the current result, or "
+                    f"abort."
+                ),
+            }
 
         if agent == "developer":
             developer_turns = sum(
@@ -710,7 +943,7 @@ def _build_next_action(task_dict: dict[str, Any], workspace_path: Path) -> dict[
             }
 
     iteration = len(task_dict.get("turns") or []) + 1
-    prompt = _build_prompt(agent, task_dict, workspace_path)
+    prompt = _build_prompt(agent, task_dict, workspace_path, gate_note=gate_note)
     token = mint_token(task_dict["id"], iteration, agent, prompt)
 
     return {
@@ -785,6 +1018,10 @@ def _cmd_init_dev(args: argparse.Namespace) -> int:
     except ValueError as e:
         return _emit_error(str(e), exit_code=2)
 
+    metadata: dict[str, Any] = {}
+    if parsed.get("budget"):
+        metadata["token_budget"] = parsed["budget"]
+
     tm = TaskManager(cfg)
     task = tm.create_task(
         prompt=parsed["prompt"],
@@ -794,6 +1031,7 @@ def _cmd_init_dev(args: argparse.Namespace) -> int:
         workspace_repo=parsed["repo"],
         workspace_branch=parsed["branch"],
         task_type="dev_v2" if parsed.get("pipeline") == "v2" else "dev",
+        metadata=metadata or None,
     )
 
     wm = WorkspaceManager(cfg)
