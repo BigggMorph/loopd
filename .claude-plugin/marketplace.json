@@ -28,6 +28,17 @@
       "category": "development",
       "source": "./plugins/orchestrator",
       "homepage": "https://github.com/BigggMorph/loopd"
+    },
+    {
+      "name": "qa-check",
+      "description": "PR-level QA agent (experimental). Generates L3 browser QA scenarios from PR diff + ticket intent, runs them as Playwright specs, and produces a merge-decision evidence report for human review. Run /qa-check <PR|commit>.",
+      "author": {
+        "name": "BigggMorph",
+        "email": "biggg.morph@gmail.com"
+      },
+      "category": "development",
+      "source": "./plugins/qa-check",
+      "homepage": "https://github.com/BigggMorph/loopd"
     }
   ]
 }

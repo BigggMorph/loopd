@@ -1,0 +1,9 @@
+{
+  "name": "qa-check",
+  "version": "0.1.0-experimental",
+  "description": "PR-level QA agent (experimental). Analyzes a PR diff + ticket intent, generates L3 (browser) QA scenarios as Playwright specs, runs them, and produces a merge-decision evidence report for human review. Run /qa-check <PR|commit>.",
+  "author": {
+    "name": "BigggMorph",
+    "email": "biggg.morph@gmail.com"
+  }
+}
