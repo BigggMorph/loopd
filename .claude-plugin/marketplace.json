@@ -17,6 +17,17 @@
       "category": "development",
       "source": "./plugins/loopd",
       "homepage": "https://github.com/BigggMorph/loopd"
+    },
+    {
+      "name": "orchestrator",
+      "description": "Autonomous GitHub issue resolution loop (experimental). Lead Claude thread + 7 teammates + auto-invoked loopd /dev-task. Run /orchestrator to start.",
+      "author": {
+        "name": "BigggMorph",
+        "email": "biggg.morph@gmail.com"
+      },
+      "category": "development",
+      "source": "./plugins/orchestrator",
+      "homepage": "https://github.com/BigggMorph/loopd"
     }
   ]
 }
